@@ -22,7 +22,7 @@ import java.util.function.Consumer;
 public abstract class ColumnDef implements Cloneable {
 	protected static final Interner INTERNER = Interners.newWeakInterner();
 	private static final DynamicEnum dynamicEnum = new DynamicEnum(Byte.MAX_VALUE);
-	private String name;
+	protected String name;
 	private final byte type;
 	private short pos;
 
