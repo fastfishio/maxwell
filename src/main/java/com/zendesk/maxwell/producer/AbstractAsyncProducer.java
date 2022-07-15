@@ -7,6 +7,11 @@ import com.zendesk.maxwell.monitoring.Metrics;
 import com.zendesk.maxwell.replication.Position;
 import com.zendesk.maxwell.row.RowMap;
 
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
 import java.util.concurrent.TimeUnit;
 
 public abstract class AbstractAsyncProducer extends AbstractProducer {
@@ -63,6 +68,8 @@ public abstract class AbstractAsyncProducer extends AbstractProducer {
 
 	public abstract void sendAsync(RowMap r, CallbackCompleter cc) throws Exception;
 
+	public void sendMultiAsync(Map<RowMap,CallbackCompleter> rowCallbackPairs) throws Exception{};
+
 	@Override
 	public final void push(RowMap r) throws Exception {
 		Position position = r.getNextPosition();
@@ -91,5 +98,39 @@ public abstract class AbstractAsyncProducer extends AbstractProducer {
 		CallbackCompleter cc = new CallbackCompleter(inflightMessages, position, r.isTXCommit(), context, messageID);
 
 		sendAsync(r, cc);
+	}
+
+	public final void multiPush(List<RowMap> rowList) throws Exception {
+
+		Map<RowMap,CallbackCompleter> rowCallbackPairs = new HashMap<RowMap,CallbackCompleter>();
+		for(RowMap r : rowList){
+			Position position = r.getNextPosition();
+			// Rows that do not get sent to a target will be automatically marked as complete.
+			// We will attempt to commit a checkpoint up to the current row.
+			if(!r.shouldOutput(outputConfig)) {
+				if ( position != null ) {
+					inflightMessages.addMessage(position, r.getTimestampMillis(), 0L);
+
+					InflightMessageList.InflightMessage completed = inflightMessages.completeMessage(position);
+					if (completed != null) {
+						context.setPosition(completed.position);
+					}
+				}
+				continue;
+			}
+
+			// back-pressure from slow producers
+
+			long messageID = inflightMessages.waitForSlot();
+
+			if(r.isTXCommit()) {
+				inflightMessages.addMessage(position, r.getTimestampMillis(), messageID);
+			}
+
+			CallbackCompleter cc = new CallbackCompleter(inflightMessages, position, r.isTXCommit(), context, messageID);
+			rowCallbackPairs.put(r, cc);
+		}
+		
+		sendMultiAsync(rowCallbackPairs);
 	}
 }
