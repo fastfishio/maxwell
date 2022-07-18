@@ -101,176 +101,180 @@ class BigQueryCallback implements ApiFutureCallback<AppendRowsResponse> {
     this.failedMessageMeter.mark();
 
     LOGGER.error(t.getLocalizedMessage());
-
     Status status = Status.fromThrowable(t);
+    List<String> rowsString = new ArrayList<String>();
+    try {
+      for (RowMap r : rowCallbackPairs.keySet())
+        rowsString.add(r.toJSON());
+    } catch (Exception e) {
+        throw new RuntimeException(e);
+    }
+
+    LOGGER.error("bq insertion error in this batch -> " + String.join("\n", rowsString));
 
     if (!this.context.getConfig().ignoreProducerError) {
-      StorageException storageException = Exceptions.toStorageException(t);
-      this.parent.setError((storageException != null) ? storageException : new RuntimeException(t));
-      context.terminate();
+      this.context.terminate(new RuntimeException(t));
       return;
     }
 
     for (Map.Entry<RowMap, CallbackCompleter> pair : rowCallbackPairs.entrySet()) {
       pair.getValue().markCompleted();
     }
-
   }
 }
 
-  public class MaxwellBigQueryProducer extends AbstractProducer {
+public class MaxwellBigQueryProducer extends AbstractProducer {
 
-    private final ArrayBlockingQueue<RowMap> queue;
-    private final MaxwellBigQueryProducerWorker worker;
+  private final ArrayBlockingQueue<RowMap> queue;
+  private final MaxwellBigQueryProducerWorker worker;
 
-    public MaxwellBigQueryProducer(MaxwellContext context, String bigQueryProjectId,
-        String bigQueryDataset, String bigQueryTable)
-        throws IOException {
-      super(context);
-      this.queue = new ArrayBlockingQueue<>(100);
-      this.worker = new MaxwellBigQueryProducerWorker(context, this.queue, bigQueryProjectId, bigQueryDataset,
-          bigQueryTable);
+  public MaxwellBigQueryProducer(MaxwellContext context, String bigQueryProjectId,
+      String bigQueryDataset, String bigQueryTable)
+      throws IOException {
+    super(context);
+    this.queue = new ArrayBlockingQueue<>(100);
+    this.worker = new MaxwellBigQueryProducerWorker(context, this.queue, bigQueryProjectId, bigQueryDataset,
+        bigQueryTable);
 
-      TableName table = TableName.of(bigQueryProjectId, bigQueryDataset, bigQueryTable);
-      try {
-        this.worker.initialize(table);
-      } catch (DescriptorValidationException e) {
-        e.printStackTrace();
-      } catch (InterruptedException e) {
-        e.printStackTrace();
-      }
-
-      Thread thread = new Thread(this.worker, "maxwell-bigquery-worker");
-      thread.setDaemon(true);
-      thread.start();
+    TableName table = TableName.of(bigQueryProjectId, bigQueryDataset, bigQueryTable);
+    try {
+      this.worker.initialize(table);
+    } catch (DescriptorValidationException e) {
+      e.printStackTrace();
+    } catch (InterruptedException e) {
+      e.printStackTrace();
     }
 
-    @Override
-    public void push(RowMap r) throws Exception {
-      this.queue.put(r);
+    Thread thread = new Thread(this.worker, "maxwell-bigquery-worker");
+    thread.setDaemon(true);
+    thread.start();
+  }
+
+  @Override
+  public void push(RowMap r) throws Exception {
+    this.queue.put(r);
+  }
+}
+
+class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Runnable, StoppableTask {
+  static final Logger LOGGER = LoggerFactory.getLogger(MaxwellBigQueryProducerWorker.class);
+
+  private final ArrayBlockingQueue<RowMap> queue;
+  private StoppableTaskState taskState;
+  private Thread thread;
+  private final Object lock = new Object();
+
+  @GuardedBy("lock")
+  private RuntimeException error = null;
+  private JsonStreamWriter streamWriter;
+
+  public MaxwellBigQueryProducerWorker(MaxwellContext context,
+      ArrayBlockingQueue<RowMap> queue, String bigQueryProjectId,
+      String bigQueryDataset, String bigQueryTable) throws IOException {
+    super(context);
+    this.queue = queue;
+    Metrics metrics = context.getMetrics();
+    this.taskState = new StoppableTaskState("MaxwellBigQueryProducerWorker");
+  }
+
+  public Object getLock() {
+    return lock;
+  }
+
+  public RuntimeException getError() {
+    return error;
+  }
+
+  public void setError(RuntimeException error) {
+    this.error = error;
+  }
+
+  private void covertJSONObjectFieldsToString(JSONObject record) {
+    if (this.context.getConfig().outputConfig.includesPrimaryKeys) {
+      record.put("primary_key", record.get("primary_key").toString());
+    }
+    String data = record.has("data") == true ? record.get("data").toString() : null;
+    record.put("data", data);
+    String old = record.has("old") == true ? record.get("old").toString() : null;
+    record.put("old", old);
+  }
+
+  public void initialize(TableName tName)
+      throws DescriptorValidationException, IOException, InterruptedException {
+
+    BigQuery bigquery = BigQueryOptions.newBuilder().setProjectId(tName.getProject()).build().getService();
+    Table table = bigquery.getTable(tName.getDataset(), tName.getTable());
+    Schema schema = table.getDefinition().getSchema();
+    TableSchema tableSchema = BqToBqStorageSchemaConverter.convertTableSchema(schema);
+    streamWriter = JsonStreamWriter.newBuilder(tName.toString(), tableSchema).build();
+  }
+
+  @Override
+  public void requestStop() throws Exception {
+    taskState.requestStop();
+    streamWriter.close();
+    synchronized (this.lock) {
+      if (this.error != null) {
+        throw this.error;
+      }
     }
   }
 
-  class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Runnable, StoppableTask {
-    static final Logger LOGGER = LoggerFactory.getLogger(MaxwellBigQueryProducerWorker.class);
+  @Override
+  public void awaitStop(Long timeout) throws TimeoutException {
+    taskState.awaitStop(thread, timeout);
+  }
 
-    private final ArrayBlockingQueue<RowMap> queue;
-    private StoppableTaskState taskState;
-    private Thread thread;
-    private final Object lock = new Object();
-
-    @GuardedBy("lock")
-    private RuntimeException error = null;
-    private JsonStreamWriter streamWriter;
-
-    public MaxwellBigQueryProducerWorker(MaxwellContext context,
-        ArrayBlockingQueue<RowMap> queue, String bigQueryProjectId,
-        String bigQueryDataset, String bigQueryTable) throws IOException {
-      super(context);
-      this.queue = queue;
-      Metrics metrics = context.getMetrics();
-      this.taskState = new StoppableTaskState("MaxwellBigQueryProducerWorker");
-    }
-
-    public Object getLock() {
-      return lock;
-    }
-
-    public RuntimeException getError() {
-      return error;
-    }
-
-    public void setError(RuntimeException error) {
-      this.error = error;
-    }
-
-    private void covertJSONObjectFieldsToString(JSONObject record) {
-      if (this.context.getConfig().outputConfig.includesPrimaryKeys) {
-        record.put("primary_key", record.get("primary_key").toString());
-      }
-      String data = record.has("data") == true ? record.get("data").toString() : null;
-      record.put("data", data);
-      String old = record.has("old") == true ? record.get("old").toString() : null;
-      record.put("old", old);
-    }
-
-    public void initialize(TableName tName)
-        throws DescriptorValidationException, IOException, InterruptedException {
-
-      BigQuery bigquery = BigQueryOptions.newBuilder().setProjectId(tName.getProject()).build().getService();
-      Table table = bigquery.getTable(tName.getDataset(), tName.getTable());
-      Schema schema = table.getDefinition().getSchema();
-      TableSchema tableSchema = BqToBqStorageSchemaConverter.convertTableSchema(schema);
-      streamWriter = JsonStreamWriter.newBuilder(tName.toString(), tableSchema).build();
-    }
-
-    @Override
-    public void requestStop() throws Exception {
-      taskState.requestStop();
-      streamWriter.close();
-      synchronized (this.lock) {
-        if (this.error != null) {
-          throw this.error;
-        }
-      }
-    }
-
-    @Override
-    public void awaitStop(Long timeout) throws TimeoutException {
-      taskState.awaitStop(thread, timeout);
-    }
-
-    @Override
-    public void run() {
-      this.thread = Thread.currentThread();
-      ArrayList<RowMap> rows = new ArrayList<RowMap>(10);
-      while (true) {
-        try {
-          RowMap row = queue.take();
-          if (!taskState.isRunning()) {
-            taskState.stopped();
-            return;
-          }
-          // this.push(row);
-          rows.add(row);
-          if(rows.size() >= 10) {
-              this.multiPush(rows);
-              rows.clear();
-          }
-        } catch (Exception e) {
+  @Override
+  public void run() {
+    this.thread = Thread.currentThread();
+    ArrayList<RowMap> rows = new ArrayList<RowMap>(100);
+    while (true) {
+      try {
+        RowMap row = queue.take();
+        if (!taskState.isRunning()) {
           taskState.stopped();
-          context.terminate(e);
           return;
         }
-      }
-    }
-
-    @Override
-    public void sendAsync(RowMap r, CallbackCompleter cc) throws Exception {
-    }
-
-    @Override
-    public void sendMultiAsync(Map<RowMap, CallbackCompleter> rowCallbackPairs) throws Exception {
-      synchronized (this.lock) {
-        if (this.error != null) {
-          throw this.error;
+        // this.push(row);
+        rows.add(row);
+        if (rows.size() >= 100) {
+          this.multiPush(rows);
+          rows.clear();
         }
+      } catch (Exception e) {
+        taskState.stopped();
+        context.terminate(e);
+        return;
       }
-      JSONArray jsonArr = new JSONArray();
-      for (Map.Entry<RowMap, CallbackCompleter> pair : rowCallbackPairs.entrySet()) {
-        RowMap r = pair.getKey();
-        CallbackCompleter c = pair.getValue();
-        JSONObject record = new JSONObject(r.toJSON(outputConfig));
-        // convert json and array fields to String
-        covertJSONObjectFieldsToString(record);
-        jsonArr.put(record);
-      }
-      ApiFuture<AppendRowsResponse> future = streamWriter.append(jsonArr);
-      ApiFutures.addCallback(
-          future, new BigQueryCallback(this, rowCallbackPairs,
-              this.succeededMessageCount, this.failedMessageCount, this.succeededMessageMeter, this.failedMessageMeter,
-              this.context),
-          MoreExecutors.directExecutor());
     }
-  
+  }
+
+  @Override
+  public void sendAsync(RowMap r, CallbackCompleter cc) throws Exception {
+  }
+
+  @Override
+  public void sendMultiAsync(Map<RowMap, CallbackCompleter> rowCallbackPairs) throws Exception {
+    synchronized (this.lock) {
+      if (this.error != null) {
+        throw this.error;
+      }
+    }
+    JSONArray jsonArr = new JSONArray();
+    for (Map.Entry<RowMap, CallbackCompleter> pair : rowCallbackPairs.entrySet()) {
+      RowMap r = pair.getKey();
+      JSONObject record = new JSONObject(r.toJSON(outputConfig));
+      // convert json and array fields to String
+      covertJSONObjectFieldsToString(record);
+      jsonArr.put(record);
+    }
+    ApiFuture<AppendRowsResponse> future = streamWriter.append(jsonArr);
+    ApiFutures.addCallback(
+        future, new BigQueryCallback(this, rowCallbackPairs,
+            this.succeededMessageCount, this.failedMessageCount, this.succeededMessageMeter, this.failedMessageMeter,
+            this.context),
+        MoreExecutors.directExecutor());
+  }
+
 }
