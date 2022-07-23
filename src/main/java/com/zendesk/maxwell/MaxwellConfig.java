@@ -269,6 +269,22 @@ public class MaxwellConfig extends AbstractConfig {
 	public Duration pubsubTotalTimeout;
 
 	/**
+	 * {@link com.zendesk.maxwell.producer.MaxwellBigQueryProducer} project id
+	 */
+	public String bigQueryProjectId;
+
+	/**
+	 * {@link com.zendesk.maxwell.producer.MaxwellBigQueryProducer} dataset
+	 */
+	public String bigQueryDataset;
+
+	/**
+	 * {@link com.zendesk.maxwell.producer.MaxwellBigQueryProducer} table
+	 */
+	public String bigQueryTable;
+
+
+	/**
 	 * Used in all producers deriving from {@link com.zendesk.maxwell.producer.AbstractAsyncProducer}.<br>
 	 * In milliseconds, time a message can spend in the {@link com.zendesk.maxwell.producer.InflightMessageList}
 	 * without server acknowledgement before being considered lost.
@@ -1074,6 +1090,8 @@ public class MaxwellConfig extends AbstractConfig {
 				String k = (String) e.nextElement();
 				if (k.startsWith("custom_producer.")) {
 					this.customProducerProperties.setProperty(k.replace("custom_producer.", ""), properties.getProperty(k));
+				} else if (k.startsWith("custom_producer_")) {
+					this.customProducerProperties.setProperty(k.replace("custom_producer_", ""), properties.getProperty(k));
 				} else if (k.startsWith("kafka.")) {
 					if (k.equals("kafka.bootstrap.servers") && kafkaBootstrapServers != null)
 						continue; // don't override command line bootstrap servers with config files'

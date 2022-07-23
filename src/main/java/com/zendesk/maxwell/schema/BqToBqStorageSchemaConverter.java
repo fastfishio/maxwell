@@ -85,4 +85,8 @@ public class BqToBqStorageSchemaConverter {
     }
     return result.build();
   }
+<<<<<<< HEAD
 }
+=======
+}
+>>>>>>> salihoto-maxwell/bigquery-producer-v2
