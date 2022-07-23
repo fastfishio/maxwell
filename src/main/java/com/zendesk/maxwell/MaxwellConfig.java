@@ -269,22 +269,6 @@ public class MaxwellConfig extends AbstractConfig {
 	public Duration pubsubTotalTimeout;
 
 	/**
-	 * {@link com.zendesk.maxwell.producer.MaxwellBigQueryProducer} project id
-	 */
-	public String bigQueryProjectId;
-
-	/**
-	 * {@link com.zendesk.maxwell.producer.MaxwellBigQueryProducer} dataset
-	 */
-	public String bigQueryDataset;
-
-	/**
-	 * {@link com.zendesk.maxwell.producer.MaxwellBigQueryProducer} table
-	 */
-	public String bigQueryTable;
-
-
-	/**
 	 * Used in all producers deriving from {@link com.zendesk.maxwell.producer.AbstractAsyncProducer}.<br>
 	 * In milliseconds, time a message can spend in the {@link com.zendesk.maxwell.producer.InflightMessageList}
 	 * without server acknowledgement before being considered lost.
