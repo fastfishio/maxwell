@@ -3,18 +3,14 @@ package com.zendesk.maxwell.producer;
 import com.google.api.core.ApiFuture;
 import com.google.api.core.ApiFutureCallback;
 import com.google.api.core.ApiFutures;
-import com.google.api.services.bigquery.model.JsonObject;
 import com.google.cloud.bigquery.BigQuery;
 import com.google.cloud.bigquery.BigQueryOptions;
 import com.google.cloud.bigquery.Schema;
 import com.google.cloud.bigquery.Table;
 import com.google.cloud.bigquery.storage.v1.AppendRowsResponse;
-import com.google.cloud.bigquery.storage.v1.Exceptions;
-import com.google.cloud.bigquery.storage.v1.Exceptions.StorageException;
 import com.google.cloud.bigquery.storage.v1.JsonStreamWriter;
 import com.google.cloud.bigquery.storage.v1.TableName;
 import com.google.cloud.bigquery.storage.v1.TableSchema;
-import com.google.common.collect.ImmutableList;
 import com.google.common.util.concurrent.MoreExecutors;
 import com.google.protobuf.Descriptors.DescriptorValidationException;
 import com.zendesk.maxwell.MaxwellContext;
@@ -25,11 +21,8 @@ import com.zendesk.maxwell.schema.BqToBqStorageSchemaConverter;
 import com.zendesk.maxwell.util.StoppableTask;
 import com.zendesk.maxwell.util.StoppableTaskState;
 
-import io.grpc.Status;
-import io.grpc.Status.Code;
 import java.io.IOException;
 import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.Phaser;
 import java.util.concurrent.TimeoutException;
 import com.codahale.metrics.Counter;
 import com.codahale.metrics.Meter;
@@ -54,9 +47,6 @@ class BigQueryCallback implements ApiFutureCallback<AppendRowsResponse> {
   private Meter succeededMessageMeter;
   private Meter failedMessageMeter;
 
-  private static final int MAX_RETRY_COUNT = 2;
-  private final ImmutableList<Code> RETRIABLE_ERROR_CODES = ImmutableList.of(Code.INTERNAL, Code.ABORTED,
-      Code.CANCELLED);
 
   public BigQueryCallback(MaxwellBigQueryProducerWorker parent,
       AppendContext appendContext,
@@ -101,26 +91,13 @@ class BigQueryCallback implements ApiFutureCallback<AppendRowsResponse> {
     LOGGER.error(t.getClass().getSimpleName() + " @ " + position);
     LOGGER.error(t.getLocalizedMessage());
 
-    Status status = Status.fromThrowable(t);
-    if (appendContext.retryCount < MAX_RETRY_COUNT
-        && RETRIABLE_ERROR_CODES.contains(status.getCode())) {
-      appendContext.retryCount++;
-      try {
-        this.parent.sendAsync(appendContext.r, this.cc);
-        return;
-      } catch (Exception e) {
-        System.out.format("Failed to retry append: %s\n", e);
-      }
-    }
+    LOGGER.error("bq insertion error ->" + appendContext.data.toString());
 
-    synchronized (this.parent.getLock()) {
-      if (this.parent.getError() == null && !this.context.getConfig().ignoreProducerError) {
-        StorageException storageException = Exceptions.toStorageException(t);
-        this.parent.setError((storageException != null) ? storageException : new RuntimeException(t));
-        context.terminate();
-        return;
-      }
+    if (!this.context.getConfig().ignoreProducerError) {
+      this.context.terminate(new RuntimeException(t));
+      return;
     }
+    
     cc.markCompleted();
   }
 }
@@ -176,10 +153,6 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
   private final ArrayBlockingQueue<RowMap> queue;
   private StoppableTaskState taskState;
   private Thread thread;
-  private final Object lock = new Object();
-
-  @GuardedBy("lock")
-  private RuntimeException error = null;
   private JsonStreamWriter streamWriter;
 
   public MaxwellBigQueryProducerWorker(MaxwellContext context,
@@ -189,18 +162,6 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
     this.queue = queue;
     Metrics metrics = context.getMetrics();
     this.taskState = new StoppableTaskState("MaxwellBigQueryProducerWorker");
-  }
-
-  public Object getLock() {
-    return lock;
-  }
-
-  public RuntimeException getError() {
-    return error;
-  }
-
-  public void setError(RuntimeException error) {
-    this.error = error;
   }
 
   private void covertJSONObjectFieldsToString(JSONObject record) {
@@ -227,11 +188,6 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
   public void requestStop() throws Exception {
     taskState.requestStop();
     streamWriter.close();
-    synchronized (this.lock) {
-      if (this.error != null) {
-        throw this.error;
-      }
-    }
   }
 
   @Override
@@ -260,11 +216,6 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
 
   @Override
   public void sendAsync(RowMap r, CallbackCompleter cc) throws Exception {
-    synchronized (this.lock) {
-      if (this.error != null) {
-        throw this.error;
-      }
-    }
     JSONArray jsonArr = new JSONArray();
     JSONObject record = new JSONObject(r.toJSON(outputConfig));
     //convert json and array fields to String
