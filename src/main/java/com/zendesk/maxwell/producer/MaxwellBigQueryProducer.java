@@ -94,6 +94,11 @@ class BigQueryCallback implements ApiFutureCallback<AppendRowsResponse> {
     LOGGER.error("bq insertion error ->" + appendContext.data.toString());
 
     if (!this.context.getConfig().ignoreProducerError) {
+      if(t.getLocalizedMessage().contains("MessageSize is too large")){
+        LOGGER.warn("skipping row exceeding 10 MB" + appendContext.data.toString());
+        cc.markCompleted();
+        return;
+      }
       this.context.terminate(new RuntimeException(t));
       return;
     }
