@@ -202,6 +202,9 @@ public class MaxwellBigQueryProducer extends AbstractProducer {
 class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Runnable, StoppableTask {
   static final Logger LOGGER = LoggerFactory.getLogger(MaxwellBigQueryProducerWorker.class);
   public static final int BATCH_SIZE = 100;
+  // checked approximately, leave a buffer
+  public static final long MAX_MESSAGE_SIZE_BYTES = 5_000_000; 
+
 
 
   private final ArrayBlockingQueue<RowMap> queue;
@@ -295,6 +298,7 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
     }
   }
 
+
   @Override
   public void sendAsync(RowMap r, CallbackCompleter cc) throws Exception {
     synchronized (this.lock) {
@@ -312,7 +316,8 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
     this.appendContext.addRow(r, record, cc);
 
 	// TODO: also trigger batch if it has been a while since batch was created?
-    if(this.appendContext.callbacks.size() >= BATCH_SIZE) {
+    if(this.appendContext.callbacks.size() >= BATCH_SIZE
+       || this.appendContext.getApproximateSize() >= MAX_MESSAGE_SIZE_BYTES) {
         synchronized (this.getLock()) {
             this.attemptBatch(this.appendContext);
             this.appendContext = null;
@@ -339,6 +344,7 @@ class AppendContext {
   JSONArray data;
   int retryCount = 0;
   int records = 0;
+  int approximateSize = 0;
   public ArrayList<AbstractAsyncProducer.CallbackCompleter> callbacks;
   Position position;
 
@@ -346,15 +352,29 @@ class AppendContext {
     this.data = new JSONArray();
     this.retryCount = 0;
     this.records = 0;
+    this.approximateSize = 0;
     this.callbacks = new ArrayList<AbstractAsyncProducer.CallbackCompleter>();
   }
 
   public void addRow(RowMap r, JSONObject record, AbstractAsyncProducer.CallbackCompleter cc) {
     this.data.put(record);
+    this.approximateSize += getJsonByteSize(record);
     this.callbacks.add(cc);
     if(this.position == null) {
         this.position = r.getNextPosition();
     }
   }
+
+  private static int getJsonByteSize(Object json) {
+    // Estimate byte size. UTF-8 encoding is assumed, which is standard for JSON.
+    // This is an approximation; actual gRPC message size might differ slightly.
+    return json.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+  }
+
+  public int getApproximateSize() {
+    return approximateSize;
+  }
+
 }
+
 
