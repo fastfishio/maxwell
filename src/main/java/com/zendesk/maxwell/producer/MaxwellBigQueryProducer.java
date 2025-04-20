@@ -308,6 +308,7 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
     covertJSONObjectFieldsToString(record);
     this.appendContext.addRow(r, record, cc);
 
+	// TODO: also trigger batch if it has been a while since batch was created?
     if(this.appendContext.callbacks.size() >= 100) {
         synchronized (this.getLock()) {
             this.attemptBatch(this.appendContext);
