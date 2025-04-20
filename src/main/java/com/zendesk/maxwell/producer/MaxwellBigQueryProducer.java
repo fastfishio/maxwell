@@ -145,10 +145,11 @@ public class MaxwellBigQueryProducer extends AbstractProducer {
   private final ExecutorService callbackExecutor;
 
   public MaxwellBigQueryProducer(MaxwellContext context, String bigQueryProjectId,
-      String bigQueryDataset, String bigQueryTable, int numWorkers) 
+      String bigQueryDataset, String bigQueryTable) 
       throws IOException {
     super(context);
-    this.queue = new ArrayBlockingQueue<>(2000);
+    int numWorkers = Runtime.getRuntime().availableProcessors();
+    this.queue = new ArrayBlockingQueue<>(numWorkers * MaxwellBigQueryProducerWorker.BATCH_SIZE);
 
     ThreadFactory workerThreadFactory = new ThreadFactoryBuilder().setNameFormat("bq-worker-%d").setDaemon(true).build();
     this.workerExecutor = Executors.newFixedThreadPool(Math.max(1, numWorkers), workerThreadFactory);
@@ -200,6 +201,8 @@ public class MaxwellBigQueryProducer extends AbstractProducer {
 }
 class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Runnable, StoppableTask {
   static final Logger LOGGER = LoggerFactory.getLogger(MaxwellBigQueryProducerWorker.class);
+  public static final int BATCH_SIZE = 100;
+
 
   private final ArrayBlockingQueue<RowMap> queue;
   private StoppableTaskState taskState;
@@ -309,7 +312,7 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
     this.appendContext.addRow(r, record, cc);
 
 	// TODO: also trigger batch if it has been a while since batch was created?
-    if(this.appendContext.callbacks.size() >= 100) {
+    if(this.appendContext.callbacks.size() >= BATCH_SIZE) {
         synchronized (this.getLock()) {
             this.attemptBatch(this.appendContext);
             this.appendContext = null;
