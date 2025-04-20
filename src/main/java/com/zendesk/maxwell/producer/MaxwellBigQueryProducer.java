@@ -16,7 +16,6 @@ import com.google.cloud.bigquery.storage.v1.TableName;
 import com.google.cloud.bigquery.storage.v1.TableSchema;
 
 import com.google.common.collect.ImmutableList;
-import com.google.common.util.concurrent.MoreExecutors; // Removed later
 import com.google.common.util.concurrent.ThreadFactoryBuilder; // For naming threads
 import com.google.protobuf.Descriptors.DescriptorValidationException;
 import com.zendesk.maxwell.MaxwellContext;
@@ -36,7 +35,10 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Phaser;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 import com.codahale.metrics.Counter;
@@ -215,6 +217,7 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
   @GuardedBy("lock")
   private RuntimeException error = null; 
   private JsonStreamWriter streamWriter;
+  private final ScheduledExecutorService scheduledExecutor;
   private final ExecutorService callbackExecutor;
   private final int workerId;
   private AppendContext appendContext;
@@ -227,6 +230,7 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
     this.queue = queue;
     this.callbackExecutor = callbackExecutor; 
     this.workerId = workerId;
+    this.scheduledExecutor = Executors.newSingleThreadScheduledExecutor(new ThreadFactoryBuilder().setNameFormat("bq-batch-scheduler-" + workerId).setDaemon(true).build());
     Metrics metrics = context.getMetrics();
     this.taskState = new StoppableTaskState("MaxwellBigQueryProducerWorker-" + workerId); // Keep taskState init
   }
@@ -267,6 +271,7 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
   public void requestStop() throws Exception {
     taskState.requestStop();
     streamWriter.close();
+    scheduledExecutor.shutdown();
     synchronized (this.lock) {
       if (this.error != null) {
         throw this.error;
@@ -308,6 +313,7 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
 
       if(this.appendContext == null) {
         this.appendContext = new AppendContext();
+        this.scheduleAttempt(this.appendContext);
       }
     }
 
@@ -315,7 +321,6 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
     covertJSONObjectFieldsToString(record);
     this.appendContext.addRow(r, record, cc);
 
-	// TODO: also trigger batch if it has been a while since batch was created?
     if(this.appendContext.callbacks.size() >= BATCH_SIZE
        || this.appendContext.getApproximateSize() >= MAX_MESSAGE_SIZE_BYTES) {
         synchronized (this.getLock()) {
@@ -326,6 +331,9 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
   }
 
   public void attemptBatch(AppendContext appendContext) throws DescriptorValidationException, IOException {
+    if(appendContext.scheduledTask != null && !appendContext.scheduledTask.isDone()) {
+      appendContext.scheduledTask.cancel(false);
+    }
     ApiFuture<AppendRowsResponse> future = streamWriter.append(appendContext.data);
 
     ApiFutures.addCallback(
@@ -334,9 +342,22 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
             this.context),
         this.callbackExecutor
     );
-
   }
 
+
+  public void scheduleAttempt(final AppendContext appendContext) {
+    appendContext.scheduledTask = this.scheduledExecutor.schedule(() -> {
+      try {
+        synchronized (this.getLock()) {
+          this.attemptBatch(this.appendContext);
+          this.appendContext = null; // Nullify after attempting via scheduler
+        }
+      } catch (Exception e) {
+        LOGGER.error("Error sending scheduled bigquery batch message");
+        e.printStackTrace();
+      }
+    }, 1, TimeUnit.MINUTES); // 1 minute delay
+  }
 }
 
 
@@ -345,8 +366,9 @@ class AppendContext {
   int retryCount = 0;
   int records = 0;
   int approximateSize = 0;
-  public ArrayList<AbstractAsyncProducer.CallbackCompleter> callbacks;
   Position position;
+  public ArrayList<AbstractAsyncProducer.CallbackCompleter> callbacks;
+  public ScheduledFuture<?> scheduledTask;
 
   AppendContext() {
     this.data = new JSONArray();
