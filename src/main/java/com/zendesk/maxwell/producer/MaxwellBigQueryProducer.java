@@ -3,7 +3,7 @@ package com.zendesk.maxwell.producer;
 import com.google.api.core.ApiFuture;
 import com.google.api.core.ApiFutureCallback;
 import com.google.api.core.ApiFutures;
-import com.google.api.services.bigquery.model.JsonObject;
+// Keep other Google Cloud imports: BigQuery, BigQueryOptions, Schema, Table, storage.v1.*
 import com.google.cloud.bigquery.BigQuery;
 import com.google.cloud.bigquery.BigQueryOptions;
 import com.google.cloud.bigquery.Schema;
@@ -14,8 +14,10 @@ import com.google.cloud.bigquery.storage.v1.Exceptions.StorageException;
 import com.google.cloud.bigquery.storage.v1.JsonStreamWriter;
 import com.google.cloud.bigquery.storage.v1.TableName;
 import com.google.cloud.bigquery.storage.v1.TableSchema;
+
 import com.google.common.collect.ImmutableList;
-import com.google.common.util.concurrent.MoreExecutors;
+import com.google.common.util.concurrent.MoreExecutors; // Removed later
+import com.google.common.util.concurrent.ThreadFactoryBuilder; // For naming threads
 import com.google.protobuf.Descriptors.DescriptorValidationException;
 import com.zendesk.maxwell.MaxwellContext;
 import com.zendesk.maxwell.monitoring.Metrics;
@@ -28,9 +30,15 @@ import com.zendesk.maxwell.util.StoppableTaskState;
 import io.grpc.Status;
 import io.grpc.Status.Code;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Phaser;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeoutException;
+
 import com.codahale.metrics.Counter;
 import com.codahale.metrics.Meter;
 
@@ -58,7 +66,7 @@ class BigQueryCallback implements ApiFutureCallback<AppendRowsResponse> {
   private final ImmutableList<Code> RETRIABLE_ERROR_CODES = ImmutableList.of(Code.INTERNAL, Code.ABORTED,
       Code.CANCELLED);
 
-  public BigQueryCallback(MaxwellBigQueryProducerWorker parent,
+  public BigQueryCallback(MaxwellBigQueryProducerWorker parent, 
       AppendContext appendContext,
       AbstractAsyncProducer.CallbackCompleter cc,
       Position position,
@@ -83,8 +91,8 @@ class BigQueryCallback implements ApiFutureCallback<AppendRowsResponse> {
 
     if (LOGGER.isDebugEnabled()) {
       try {
-        LOGGER.debug("-> {}\n" +
-            " {}\n",
+        LOGGER.debug("Worker {} -> {}\n {}\n", // Add worker ID
+            parent.getWorkerId(), // Get ID from parent
             this.appendContext.r.toJSON(), this.position);
       } catch (Exception e) {
         e.printStackTrace();
@@ -98,8 +106,8 @@ class BigQueryCallback implements ApiFutureCallback<AppendRowsResponse> {
     this.failedMessageCount.inc();
     this.failedMessageMeter.mark();
 
-    LOGGER.error(t.getClass().getSimpleName() + " @ " + position);
-    LOGGER.error(t.getLocalizedMessage());
+    LOGGER.error("Worker {} " + t.getClass().getSimpleName() + " @ " + position, parent.getWorkerId());
+    LOGGER.error("Worker {} " + t.getLocalizedMessage(), parent.getWorkerId());
 
     Status status = Status.fromThrowable(t);
     if (appendContext.retryCount < MAX_RETRY_COUNT
@@ -109,7 +117,7 @@ class BigQueryCallback implements ApiFutureCallback<AppendRowsResponse> {
         this.parent.sendAsync(appendContext.r, this.cc);
         return;
       } catch (Exception e) {
-        System.out.format("Failed to retry append: %s\n", e);
+        System.out.format("Worker {} Failed to retry append: %s\n", parent.getWorkerId(), e);
       }
     }
 
@@ -126,30 +134,60 @@ class BigQueryCallback implements ApiFutureCallback<AppendRowsResponse> {
 }
 
 public class MaxwellBigQueryProducer extends AbstractProducer {
+  private static final Logger LOGGER = LoggerFactory.getLogger(MaxwellBigQueryProducer.class);
 
   private final ArrayBlockingQueue<RowMap> queue;
-  private final MaxwellBigQueryProducerWorker worker;
+  private final List<MaxwellBigQueryProducerWorker> workers;
+  private final ExecutorService workerExecutor;
+  private final ExecutorService callbackExecutor;
 
   public MaxwellBigQueryProducer(MaxwellContext context, String bigQueryProjectId,
-      String bigQueryDataset, String bigQueryTable)
+      String bigQueryDataset, String bigQueryTable, int numWorkers) 
       throws IOException {
     super(context);
-    this.queue = new ArrayBlockingQueue<>(100);
-    this.worker = new MaxwellBigQueryProducerWorker(context, this.queue, bigQueryProjectId, bigQueryDataset,
-        bigQueryTable);
+    this.queue = new ArrayBlockingQueue<>(2000);
 
-    TableName table = TableName.of(bigQueryProjectId, bigQueryDataset, bigQueryTable);
-    try {
-      this.worker.initialize(table);
-    } catch (DescriptorValidationException e) {
-      e.printStackTrace();
-    } catch (InterruptedException e) {
-      e.printStackTrace();
+    ThreadFactory workerThreadFactory = new ThreadFactoryBuilder().setNameFormat("bq-worker-%d").setDaemon(true).build();
+    this.workerExecutor = Executors.newFixedThreadPool(Math.max(1, numWorkers), workerThreadFactory);
+
+    ThreadFactory callbackThreadFactory = new ThreadFactoryBuilder().setNameFormat("bq-callback-%d").setDaemon(true).build();
+    this.callbackExecutor = Executors.newCachedThreadPool(callbackThreadFactory);
+
+    this.workers = new ArrayList<>(Math.max(1, numWorkers));
+    TableName tableName = TableName.of(bigQueryProjectId, bigQueryDataset, bigQueryTable);
+    startWorkers(context, tableName);
+  }
+  
+  private void startWorkers(MaxwellContext context, TableName tableName) throws IOException {
+    int numWorkers = this.workers.size();
+    TableSchema tableSchema = getTableSchema(tableName);
+     // Create and start workers
+    for (int i = 0; i < Math.max(1, numWorkers); i++) {
+       try {
+            MaxwellBigQueryProducerWorker worker = new MaxwellBigQueryProducerWorker(
+                context,
+                this.queue,
+                this.callbackExecutor, // Pass callback executor
+                i // Pass worker ID
+            );
+            worker.initialize(tableName, tableSchema);
+            this.workers.add(worker);
+            this.workerExecutor.submit(worker);
+       } catch (DescriptorValidationException | IOException | InterruptedException e) {
+           LOGGER.error("Failed to initialize MaxwellBigQueryProducer worker {}: {}", i, e.getMessage(), e);
+           // Don't try to shutdown executors, just throw
+           throw new IOException("Failed to initialize worker " + i, e);
+       }
     }
+    LOGGER.info("Submitted {} workers to executor.", this.workers.size());
+  }
 
-    Thread thread = new Thread(this.worker, "maxwell-bigquery-worker");
-    thread.setDaemon(true);
-    thread.start();
+  private TableSchema getTableSchema(TableName tName) throws IOException {
+    BigQuery bigquery = BigQueryOptions.newBuilder().setProjectId(tName.getProject()).build().getService();
+    Table table = bigquery.getTable(tName.getDataset(), tName.getTable());
+    Schema schema = table.getDefinition().getSchema();
+    TableSchema tableSchema = BqToBqStorageSchemaConverter.convertTableSchema(schema);
+    return tableSchema;
   }
 
   @Override
@@ -179,20 +217,29 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
   private final Object lock = new Object();
 
   @GuardedBy("lock")
-  private RuntimeException error = null;
+  private RuntimeException error = null; 
   private JsonStreamWriter streamWriter;
+  private final ExecutorService callbackExecutor;
+  private final int workerId;
 
   public MaxwellBigQueryProducerWorker(MaxwellContext context,
-      ArrayBlockingQueue<RowMap> queue, String bigQueryProjectId,
-      String bigQueryDataset, String bigQueryTable) throws IOException {
+      ArrayBlockingQueue<RowMap> queue,
+      ExecutorService callbackExecutor,
+      int workerId) throws IOException {
     super(context);
     this.queue = queue;
+    this.callbackExecutor = callbackExecutor; 
+    this.workerId = workerId;
     Metrics metrics = context.getMetrics();
-    this.taskState = new StoppableTaskState("MaxwellBigQueryProducerWorker");
+    this.taskState = new StoppableTaskState("MaxwellBigQueryProducerWorker-" + workerId); // Keep taskState init
   }
 
   public Object getLock() {
     return lock;
+  }
+
+  public int getWorkerId() {
+    return workerId;
   }
 
   public RuntimeException getError() {
@@ -213,14 +260,10 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
     record.put("old", old);
   }
 
-  public void initialize(TableName tName)
-      throws DescriptorValidationException, IOException, InterruptedException {
 
-    BigQuery bigquery = BigQueryOptions.newBuilder().setProjectId(tName.getProject()).build().getService();
-    Table table = bigquery.getTable(tName.getDataset(), tName.getTable());
-    Schema schema = table.getDefinition().getSchema();
-    TableSchema tableSchema = BqToBqStorageSchemaConverter.convertTableSchema(schema);
-    streamWriter = JsonStreamWriter.newBuilder(tName.toString(), tableSchema).build();
+  public void initialize(TableName tName, TableSchema tableSchema)
+      throws DescriptorValidationException, IOException, InterruptedException {
+    this.streamWriter = JsonStreamWriter.newBuilder(tName.toString(), tableSchema).build();
   }
 
   @Override
@@ -265,18 +308,21 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
         throw this.error;
       }
     }
+
     JSONArray jsonArr = new JSONArray();
     JSONObject record = new JSONObject(r.toJSON(outputConfig));
-    //convert json and array fields to String
     covertJSONObjectFieldsToString(record);
     jsonArr.put(record);
     AppendContext appendContext = new AppendContext(jsonArr, 0, r);
 
     ApiFuture<AppendRowsResponse> future = streamWriter.append(appendContext.data);
+
     ApiFutures.addCallback(
         future, new BigQueryCallback(this, appendContext, cc, r.getNextPosition(),
             this.succeededMessageCount, this.failedMessageCount, this.succeededMessageMeter, this.failedMessageMeter,
             this.context),
-        MoreExecutors.directExecutor());
+        this.callbackExecutor
+    );
   }
+
 }
