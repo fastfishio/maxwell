@@ -52,7 +52,6 @@ class BigQueryCallback implements ApiFutureCallback<AppendRowsResponse> {
   public final Logger LOGGER = LoggerFactory.getLogger(BigQueryCallback.class);
 
   private final MaxwellBigQueryProducerWorker parent;
-  private final AbstractAsyncProducer.CallbackCompleter cc;
   private final Position position;
   private MaxwellContext context;
   AppendContext appendContext;
@@ -68,15 +67,12 @@ class BigQueryCallback implements ApiFutureCallback<AppendRowsResponse> {
 
   public BigQueryCallback(MaxwellBigQueryProducerWorker parent, 
       AppendContext appendContext,
-      AbstractAsyncProducer.CallbackCompleter cc,
-      Position position,
       Counter producedMessageCount, Counter failedMessageCount,
       Meter succeededMessageMeter, Meter failedMessageMeter,
       MaxwellContext context) {
     this.parent = parent;
     this.appendContext = appendContext;
-    this.cc = cc;
-    this.position = position;
+    this.position = appendContext.position;
     this.succeededMessageCount = producedMessageCount;
     this.failedMessageCount = failedMessageCount;
     this.succeededMessageMeter = succeededMessageMeter;
@@ -86,25 +82,28 @@ class BigQueryCallback implements ApiFutureCallback<AppendRowsResponse> {
 
   @Override
   public void onSuccess(AppendRowsResponse response) {
-    this.succeededMessageCount.inc();
-    this.succeededMessageMeter.mark();
+    for (int i = 0; i < appendContext.callbacks.size(); i++) {
+        this.succeededMessageCount.inc();
+        this.succeededMessageMeter.mark();
+        AbstractAsyncProducer.CallbackCompleter cc = (AbstractAsyncProducer.CallbackCompleter) appendContext.callbacks.get(i);
+        cc.markCompleted();
 
-    if (LOGGER.isDebugEnabled()) {
-      try {
-        LOGGER.debug("Worker {} -> {}\n {}\n", // Add worker ID
-            parent.getWorkerId(), // Get ID from parent
-            this.appendContext.r.toJSON(), this.position);
-      } catch (Exception e) {
-        e.printStackTrace();
-      }
+        if (LOGGER.isDebugEnabled()) {
+          try {
+            LOGGER.debug("Worker {} -> {}\n", parent.getWorkerId(), this.position); 
+          } catch (Exception e) {
+            e.printStackTrace();
+          }
+        }
     }
-    cc.markCompleted();
   }
 
   @Override
   public void onFailure(Throwable t) {
-    this.failedMessageCount.inc();
-    this.failedMessageMeter.mark();
+    for (int i = 0; i < appendContext.callbacks.size(); i++) {
+        this.failedMessageCount.inc();
+        this.failedMessageMeter.mark();
+    }
 
     LOGGER.error("Worker {} " + t.getClass().getSimpleName() + " @ " + position, parent.getWorkerId());
     LOGGER.error("Worker {} " + t.getLocalizedMessage(), parent.getWorkerId());
@@ -114,7 +113,7 @@ class BigQueryCallback implements ApiFutureCallback<AppendRowsResponse> {
         && RETRIABLE_ERROR_CODES.contains(status.getCode())) {
       appendContext.retryCount++;
       try {
-        this.parent.sendAsync(appendContext.r, this.cc);
+        this.parent.attemptBatch(appendContext);
         return;
       } catch (Exception e) {
         System.out.format("Worker {} Failed to retry append: %s\n", parent.getWorkerId(), e);
@@ -129,7 +128,11 @@ class BigQueryCallback implements ApiFutureCallback<AppendRowsResponse> {
         return;
       }
     }
-    cc.markCompleted();
+    // got an error, but we are ingoring producer error
+    for (int i = 0; i < appendContext.callbacks.size(); i++) {
+        AbstractAsyncProducer.CallbackCompleter cc = (AbstractAsyncProducer.CallbackCompleter) appendContext.callbacks.get(i);
+        cc.markCompleted();
+    }
   }
 }
 
@@ -195,19 +198,6 @@ public class MaxwellBigQueryProducer extends AbstractProducer {
     this.queue.put(r);
   }
 }
-
-class AppendContext {
-  JSONArray data;
-  int retryCount = 0;
-  RowMap r = null;
-
-  AppendContext(JSONArray data, int retryCount, RowMap r) {
-    this.data = data;
-    this.retryCount = retryCount;
-    this.r = r;
-  }
-}
-
 class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Runnable, StoppableTask {
   static final Logger LOGGER = LoggerFactory.getLogger(MaxwellBigQueryProducerWorker.class);
 
@@ -221,6 +211,7 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
   private JsonStreamWriter streamWriter;
   private final ExecutorService callbackExecutor;
   private final int workerId;
+  private AppendContext appendContext;
 
   public MaxwellBigQueryProducerWorker(MaxwellContext context,
       ArrayBlockingQueue<RowMap> queue,
@@ -307,22 +298,59 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
       if (this.error != null) {
         throw this.error;
       }
+
+      if(this.appendContext == null) {
+        this.appendContext = new AppendContext();
+      }
     }
 
-    JSONArray jsonArr = new JSONArray();
     JSONObject record = new JSONObject(r.toJSON(outputConfig));
     covertJSONObjectFieldsToString(record);
-    jsonArr.put(record);
-    AppendContext appendContext = new AppendContext(jsonArr, 0, r);
+    this.appendContext.addRow(r, record, cc);
 
+    if(this.appendContext.callbacks.size() >= 100) {
+        synchronized (this.getLock()) {
+            this.attemptBatch(this.appendContext);
+            this.appendContext = null;
+        }
+    }
+  }
+
+  public void attemptBatch(AppendContext appendContext) throws DescriptorValidationException, IOException {
     ApiFuture<AppendRowsResponse> future = streamWriter.append(appendContext.data);
 
     ApiFutures.addCallback(
-        future, new BigQueryCallback(this, appendContext, cc, r.getNextPosition(),
+        future, new BigQueryCallback(this, appendContext,
             this.succeededMessageCount, this.failedMessageCount, this.succeededMessageMeter, this.failedMessageMeter,
             this.context),
         this.callbackExecutor
     );
+
   }
 
 }
+
+
+class AppendContext {
+  JSONArray data;
+  int retryCount = 0;
+  int records = 0;
+  public ArrayList<AbstractAsyncProducer.CallbackCompleter> callbacks;
+  Position position;
+
+  AppendContext() {
+    this.data = new JSONArray();
+    this.retryCount = 0;
+    this.records = 0;
+    this.callbacks = new ArrayList<AbstractAsyncProducer.CallbackCompleter>();
+  }
+
+  public void addRow(RowMap r, JSONObject record, AbstractAsyncProducer.CallbackCompleter cc) {
+    this.data.put(record);
+    this.callbacks.add(cc);
+    if(this.position == null) {
+        this.position = r.getNextPosition();
+    }
+  }
+}
+
