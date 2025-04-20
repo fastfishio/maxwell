@@ -31,4 +31,16 @@ WORKDIR /app
 RUN echo "$MAXWELL_VERSION" > /REVISION
 #USER 1000
 
+
+RUN apt-get update && apt-get install -y --no-install-recommends wget unzip procps python3-pip htop
+
+
+ARG ASYNC_PROFILER_VERSION=2.9
+RUN wget https://github.com/jvm-profiling-tools/async-profiler/releases/download/v${ASYNC_PROFILER_VERSION}/async-profiler-${ASYNC_PROFILER_VERSION}-linux-x64.tar.gz -O /tmp/async-profiler.tar.gz \
+    && tar -xzf /tmp/async-profiler.tar.gz -C /opt \
+    && rm /tmp/async-profiler.tar.gz
+ENV ASYNC_PROFILER_HOME=/opt/async-profiler-${ASYNC_PROFILER_VERSION}-linux-x64
+ENV PATH="$PATH:${ASYNC_PROFILER_HOME}"
+
+
 CMD [ "/bin/bash", "-c", "bin/maxwell-docker" ]
