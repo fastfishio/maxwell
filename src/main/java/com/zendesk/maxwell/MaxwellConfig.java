@@ -278,6 +278,11 @@ public class MaxwellConfig extends AbstractConfig {
 	 */
 	public String bigQueryTable;
 
+	/**
+	 * {@link com.zendesk.maxwell.producer.MaxwellBigQueryProducer} threads
+	 */
+	public int bigQueryThreads;
+
 
 	/**
 	 * Used in all producers deriving from {@link com.zendesk.maxwell.producer.AbstractAsyncProducer}.<br>
@@ -831,6 +836,8 @@ public class MaxwellConfig extends AbstractConfig {
 				.withRequiredArg();
 		parser.accepts( "bigquery_table", "provide a google cloud platform table id associated with the bigquery table" )
 				.withRequiredArg();
+		parser.accepts( "bigquery_threads", "number of threads to start to write data to bigquery" )
+				.withRequiredArg();
 
 		parser.section( "pubsub" );
 		parser.accepts( "pubsub_project_id", "provide a google cloud platform project id associated with the pubsub topic" )
@@ -1040,6 +1047,7 @@ public class MaxwellConfig extends AbstractConfig {
 		this.bigQueryProjectId		= fetchStringOption("bigquery_project_id", options, properties, null);
 		this.bigQueryDataset		= fetchStringOption("bigquery_dataset", options, properties, null);
 		this.bigQueryTable			= fetchStringOption("bigquery_table", options, properties, null);
+		this.bigQueryThreads		= fetchIntegerOption("bigquery_threads", options, properties, 2);
 
 		this.pubsubProjectId					= fetchStringOption("pubsub_project_id", options, properties, null);
 		this.pubsubTopic						= fetchStringOption("pubsub_topic", options, properties, "maxwell");
