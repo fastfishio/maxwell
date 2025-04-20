@@ -145,19 +145,19 @@ public class MaxwellBigQueryProducer extends AbstractProducer {
   private final ExecutorService callbackExecutor;
 
   public MaxwellBigQueryProducer(MaxwellContext context, String bigQueryProjectId,
-      String bigQueryDataset, String bigQueryTable) 
+      String bigQueryDataset, String bigQueryTable, int bigqueryThreads) 
       throws IOException {
     super(context);
-    int numWorkers = Runtime.getRuntime().availableProcessors();
-    this.queue = new ArrayBlockingQueue<>(numWorkers * MaxwellBigQueryProducerWorker.BATCH_SIZE);
+    bigqueryThreads = Math.max(1, bigqueryThreads);
+    this.queue = new ArrayBlockingQueue<>(bigqueryThreads * MaxwellBigQueryProducerWorker.BATCH_SIZE);
 
     ThreadFactory workerThreadFactory = new ThreadFactoryBuilder().setNameFormat("bq-worker-%d").setDaemon(true).build();
-    this.workerExecutor = Executors.newFixedThreadPool(Math.max(1, numWorkers), workerThreadFactory);
+    this.workerExecutor = Executors.newFixedThreadPool(bigqueryThreads, workerThreadFactory);
 
     ThreadFactory callbackThreadFactory = new ThreadFactoryBuilder().setNameFormat("bq-callback-%d").setDaemon(true).build();
     this.callbackExecutor = Executors.newCachedThreadPool(callbackThreadFactory);
 
-    this.workers = new ArrayList<>(Math.max(1, numWorkers));
+    this.workers = new ArrayList<>(bigqueryThreads);
     TableName tableName = TableName.of(bigQueryProjectId, bigQueryDataset, bigQueryTable);
     startWorkers(context, tableName);
   }
