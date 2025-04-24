@@ -35,7 +35,7 @@ RUN echo "$MAXWELL_VERSION" > /REVISION
 
 
 RUN apt-get update && apt-get install -y --no-install-recommends wget unzip procps python3-pip htop
-RUN pipx install magic-wormhole
+# RUN pipx install magic-wormhole
 
 ARG ASYNC_PROFILER_VERSION=2.9
 RUN wget https://github.com/jvm-profiling-tools/async-profiler/releases/download/v${ASYNC_PROFILER_VERSION}/async-profiler-${ASYNC_PROFILER_VERSION}-linux-x64.tar.gz -O /tmp/async-profiler.tar.gz \
