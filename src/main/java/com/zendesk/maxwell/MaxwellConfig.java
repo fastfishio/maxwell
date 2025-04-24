@@ -303,6 +303,9 @@ public class MaxwellConfig extends AbstractConfig {
 	public String bigQueryTable;
 
 
+	public int bigQueryThreads;
+
+
 	/**
 	 * Used in all producers deriving from {@link com.zendesk.maxwell.producer.AbstractAsyncProducer}.<br>
 	 * In milliseconds, time a message can spend in the {@link com.zendesk.maxwell.producer.InflightMessageList}
