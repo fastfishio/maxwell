@@ -45,6 +45,7 @@ public class BqToBqStorageSchemaConverter {
           .put(StandardSQLTypeName.STRUCT, TableFieldSchema.Type.STRUCT)
           .put(StandardSQLTypeName.TIME, TableFieldSchema.Type.TIME)
           .put(StandardSQLTypeName.TIMESTAMP, TableFieldSchema.Type.TIMESTAMP)
+          .put(StandardSQLTypeName.JSON, TableFieldSchema.Type.JSON)
           .build();
 
   /**
