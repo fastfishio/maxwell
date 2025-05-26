@@ -67,7 +67,7 @@ class BigQueryCallback implements ApiFutureCallback<AppendRowsResponse> {
   private final ImmutableList<Code> RETRIABLE_ERROR_CODES = ImmutableList.of(Code.INTERNAL, Code.ABORTED,
       Code.CANCELLED);
 
-  public BigQueryCallback(MaxwellBigQueryProducerWorker parent, 
+  public BigQueryCallback(MaxwellBigQueryProducerWorker parent,
       AppendContext appendContext,
       Counter producedMessageCount, Counter failedMessageCount,
       Meter succeededMessageMeter, Meter failedMessageMeter,
@@ -92,7 +92,7 @@ class BigQueryCallback implements ApiFutureCallback<AppendRowsResponse> {
 
         if (LOGGER.isDebugEnabled()) {
           try {
-            LOGGER.debug("Worker {} -> {}\n", parent.getWorkerId(), this.position); 
+            LOGGER.debug("Worker {} -> {}\n", parent.getWorkerId(), this.position);
           } catch (Exception e) {
             e.printStackTrace();
           }
@@ -147,7 +147,7 @@ public class MaxwellBigQueryProducer extends AbstractProducer {
   private final ExecutorService callbackExecutor;
 
   public MaxwellBigQueryProducer(MaxwellContext context, String bigQueryProjectId,
-      String bigQueryDataset, String bigQueryTable, int bigqueryThreads) 
+      String bigQueryDataset, String bigQueryTable, int bigqueryThreads)
       throws IOException {
     super(context);
     bigqueryThreads = Math.max(1, bigqueryThreads);
@@ -163,7 +163,7 @@ public class MaxwellBigQueryProducer extends AbstractProducer {
     TableName tableName = TableName.of(bigQueryProjectId, bigQueryDataset, bigQueryTable);
     startWorkers(context, tableName);
   }
-  
+
   private void startWorkers(MaxwellContext context, TableName tableName) throws IOException {
     int numWorkers = this.workers.size();
     TableSchema tableSchema = getTableSchema(tableName);
@@ -205,7 +205,7 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
   static final Logger LOGGER = LoggerFactory.getLogger(MaxwellBigQueryProducerWorker.class);
   public static final int BATCH_SIZE = 100;
   // checked approximately, leave a buffer
-  public static final long MAX_MESSAGE_SIZE_BYTES = 5_000_000; 
+  public static final long MAX_MESSAGE_SIZE_BYTES = 5_000_000;
 
 
 
@@ -215,7 +215,7 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
   private final Object lock = new Object();
 
   @GuardedBy("lock")
-  private RuntimeException error = null; 
+  private RuntimeException error = null;
   private JsonStreamWriter streamWriter;
   private final ScheduledExecutorService scheduledExecutor;
   private final ExecutorService callbackExecutor;
@@ -228,7 +228,7 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
       int workerId) throws IOException {
     super(context);
     this.queue = queue;
-    this.callbackExecutor = callbackExecutor; 
+    this.callbackExecutor = callbackExecutor;
     this.workerId = workerId;
     this.scheduledExecutor = Executors.newSingleThreadScheduledExecutor(new ThreadFactoryBuilder().setNameFormat("bq-batch-scheduler-" + workerId).setDaemon(true).build());
     Metrics metrics = context.getMetrics();
@@ -306,6 +306,18 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
 
   @Override
   public void sendAsync(RowMap r, CallbackCompleter cc) throws Exception {
+
+    JSONObject record = new JSONObject(r.toJSON(outputConfig));
+    covertJSONObjectFieldsToString(record);
+
+    int recordSize = getJsonByteSize(record);
+    if (recordSize >= 9 * 1024 * 1024) {
+        LOGGER.error("Worker {} skipping oversized record: {} bytes for table {}.{}, position {}",
+            this.workerId, recordSize, r.getDatabase(), r.getTable(), r.getNextPosition());
+        cc.markCompleted();
+        return;
+    }
+
     synchronized (this.lock) {
       if (this.error != null) {
         throw this.error;
@@ -398,5 +410,3 @@ class AppendContext {
   }
 
 }
-
-
