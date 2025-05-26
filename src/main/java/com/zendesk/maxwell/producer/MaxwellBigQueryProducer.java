@@ -329,8 +329,6 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
       }
     }
 
-    JSONObject record = new JSONObject(r.toJSON(outputConfig));
-    covertJSONObjectFieldsToString(record);
     this.appendContext.addRow(r, record, cc);
 
     if(this.appendContext.callbacks.size() >= BATCH_SIZE
