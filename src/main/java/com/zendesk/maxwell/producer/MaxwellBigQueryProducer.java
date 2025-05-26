@@ -310,7 +310,7 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
     JSONObject record = new JSONObject(r.toJSON(outputConfig));
     covertJSONObjectFieldsToString(record);
 
-    int recordSize = getJsonByteSize(record);
+    int recordSize = record.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
     if (recordSize >= 9 * 1024 * 1024) {
         LOGGER.error("Worker {} skipping oversized record: {} bytes for table {}.{}, position {}",
             this.workerId, recordSize, r.getDatabase(), r.getTable(), r.getNextPosition());
