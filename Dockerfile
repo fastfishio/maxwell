@@ -22,7 +22,6 @@ RUN cd /workspace \
 # Build clean image with non-root priveledge
 FROM eclipse-temurin:23-jdk
 
-
 RUN apt-get update \
     && apt-get -y upgrade
 
@@ -31,9 +30,9 @@ COPY --from=builder /REVISION /REVISION
 
 WORKDIR /app
 
-RUN useradd -u 1000 maxwell -d /app
-RUN chown 1000:1000 /app
+RUN useradd -u 10300 maxwell -d /app
+RUN chown 10300:10300 /app
 
-USER 1000
+USER 10300
 
 CMD [ "/bin/bash", "-c", "bin/maxwell-docker" ]
