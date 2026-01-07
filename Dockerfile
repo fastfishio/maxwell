@@ -20,7 +20,8 @@ RUN cd /workspace \
     && echo "$MAXWELL_VERSION" > /REVISION
 
 # Build clean image with non-root priveledge
-FROM eclipse-temurin:23-jdk-alpine
+FROM eclipse-temurin:23-jdk
+
 
 RUN apt-get update \
     && apt-get -y upgrade
