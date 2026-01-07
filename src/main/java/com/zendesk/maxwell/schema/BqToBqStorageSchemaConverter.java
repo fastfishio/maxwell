@@ -40,6 +40,7 @@ public class BqToBqStorageSchemaConverter {
           .put(StandardSQLTypeName.FLOAT64, TableFieldSchema.Type.DOUBLE)
           .put(StandardSQLTypeName.GEOGRAPHY, TableFieldSchema.Type.GEOGRAPHY)
           .put(StandardSQLTypeName.INT64, TableFieldSchema.Type.INT64)
+          // .put(StandardSQLTypeName.JSON, TableFieldSchema.Type.JSON)
           .put(StandardSQLTypeName.NUMERIC, TableFieldSchema.Type.NUMERIC)
           .put(StandardSQLTypeName.STRING, TableFieldSchema.Type.STRING)
           .put(StandardSQLTypeName.STRUCT, TableFieldSchema.Type.STRUCT)
@@ -74,7 +75,16 @@ public class BqToBqStorageSchemaConverter {
     }
     result.setMode(BQTableSchemaModeMap.get(field.getMode()));
     result.setName(field.getName());
-    result.setType(BQTableSchemaTypeMap.get(field.getType().getStandardType()));
+    
+    StandardSQLTypeName standardType = field.getType().getStandardType();
+    TableFieldSchema.Type storageType = BQTableSchemaTypeMap.get(standardType);
+    if (storageType == null) {
+      throw new IllegalArgumentException(
+          String.format("Unsupported BigQuery field type: %s for field: %s. " +
+              "Supported types: %s", standardType, field.getName(), BQTableSchemaTypeMap.keySet()));
+    }
+    result.setType(storageType);
+    
     if (field.getDescription() != null) {
       result.setDescription(field.getDescription());
     }
