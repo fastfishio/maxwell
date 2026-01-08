@@ -21,7 +21,7 @@ RUN cd /workspace \
 
 # Build clean image with non-root priveledge
 
-FROM openjdk:23-jdk-slim
+FROM eclipse-temurin:23-jre-noble
 
 RUN apt-get update \
     && apt-get -y upgrade
