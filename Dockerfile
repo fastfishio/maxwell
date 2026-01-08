@@ -20,6 +20,7 @@ RUN cd /workspace \
     && echo "$MAXWELL_VERSION" > /REVISION
 
 # Build clean image with non-root priveledge
+
 FROM openjdk:23-jdk-slim
 
 RUN apt-get update \
