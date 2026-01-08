@@ -222,11 +222,11 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
     Table table = bigquery.getTable(tName.getDataset(), tName.getTable());
     Schema schema = table.getDefinition().getSchema();
     // Filter out bq_inserted_at column from the schema
-    List<com.google.cloud.bigquery.Field> filteredFields = schema.getFields().stream()
-        .filter(field -> !"bq_inserted_at".equals(field.getName()))
-        .collect(Collectors.toList());
-    Schema filteredSchema = Schema.of(filteredFields);
-    TableSchema tableSchema = BqToBqStorageSchemaConverter.convertTableSchema(filteredSchema);
+    // List<com.google.cloud.bigquery.Field> filteredFields = schema.getFields().stream()
+    //     .filter(field -> !"bq_inserted_at".equals(field.getName()))
+    //     .collect(Collectors.toList());
+    // Schema filteredSchema = Schema.of(filteredFields);
+    TableSchema tableSchema = BqToBqStorageSchemaConverter.convertTableSchema(schema);
     streamWriter = JsonStreamWriter.newBuilder(tName.toString(), tableSchema).build();
   }
 
