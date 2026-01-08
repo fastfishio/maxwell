@@ -40,7 +40,7 @@ public class BqToBqStorageSchemaConverter {
           .put(StandardSQLTypeName.FLOAT64, TableFieldSchema.Type.DOUBLE)
           .put(StandardSQLTypeName.GEOGRAPHY, TableFieldSchema.Type.GEOGRAPHY)
           .put(StandardSQLTypeName.INT64, TableFieldSchema.Type.INT64)
-          // .put(StandardSQLTypeName.JSON, TableFieldSchema.Type.JSON)
+          .put(StandardSQLTypeName.JSON, TableFieldSchema.Type.JSON)
           .put(StandardSQLTypeName.NUMERIC, TableFieldSchema.Type.NUMERIC)
           .put(StandardSQLTypeName.STRING, TableFieldSchema.Type.STRING)
           .put(StandardSQLTypeName.STRUCT, TableFieldSchema.Type.STRUCT)
