@@ -24,6 +24,7 @@ import com.zendesk.maxwell.row.RowMapBuffer;
 import com.zendesk.maxwell.schema.*;
 import com.zendesk.maxwell.schema.columndef.ColumnDefCastException;
 import com.zendesk.maxwell.schema.ddl.DDLMap;
+import com.zendesk.maxwell.schema.ddl.InvalidSchemaError;
 import com.zendesk.maxwell.schema.ddl.ResolvedSchemaChange;
 import com.zendesk.maxwell.scripting.Scripting;
 import com.zendesk.maxwell.util.RunLoopProcess;
@@ -31,6 +32,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.sql.SQLException;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -382,7 +384,7 @@ public class BinlogConnectorReplicator extends RunLoopProcess implements Replica
 	 * @param timestamp The timestamp of the SQL binlog event
 	 */
 	private void processQueryEvent(String dbName, String sql, SchemaStore schemaStore, Position position, Position nextPosition, Long timestamp) throws Exception {
-		List<ResolvedSchemaChange> changes = schemaStore.processSQL(sql, dbName, position);
+		List<ResolvedSchemaChange> changes = processSqlWithSchemaRetry(schemaStore, sql, dbName, position);
 		Long schemaId = getSchemaId();
 
 		if ( bootstrapper != null)
@@ -400,6 +402,72 @@ public class BinlogConnectorReplicator extends RunLoopProcess implements Replica
 		}
 
 		tableCache.clear();
+	}
+
+	private List<ResolvedSchemaChange> processSqlWithSchemaRetry(SchemaStore schemaStore, String sql, String dbName, Position position) throws Exception {
+		boolean retried = false;
+		while (true) {
+			try {
+				return schemaStore.processSQL(sql, dbName, position);
+			} catch (InvalidSchemaError e) {
+				if (retried || !isSchemaMismatchError(e) || !recaptureSchema("DDL: " + sql, e)) {
+					throw e;
+				}
+				retried = true;
+				tableCache.clear();
+			}
+		}
+	}
+
+	private boolean isSchemaMismatchError(InvalidSchemaError e) {
+		String message = e.getMessage();
+		if (message == null) {
+			return false;
+		}
+		return message.contains("create existing table")
+			|| message.contains("Couldn't find table")
+			|| message.contains("Couldn't find database");
+	}
+
+	private boolean recaptureSchema(String reason, Exception e) {
+		if (!(schemaStore instanceof MysqlSchemaStore)) {
+			LOGGER.warn("Unable to recapture schema for {}: schemaStore type {}", reason, schemaStore.getClass().getName(), e);
+			return false;
+		}
+
+		try {
+			LOGGER.warn("Recapturing schema after {} due to error: {}", reason, e.getMessage());
+			((MysqlSchemaStore) schemaStore).captureAndSaveSchema();
+			return true;
+		} catch (SQLException ex) {
+			LOGGER.error("Schema recapture failed after {}.", reason, ex);
+			return false;
+		}
+	}
+
+	private void processTableMapEvent(BinlogConnectorEvent event) throws Exception {
+		TableMapEventData data = event.tableMapData();
+		boolean retried = false;
+		while (true) {
+			try {
+				tableCache.processEvent(getSchema(), this.filter, this.ignoreMissingSchema, data.getTableId(), data.getDatabase(), data.getTable());
+				return;
+			} catch (RuntimeException e) {
+				if (retried || !isMissingTableOrDatabase(e) || !recaptureSchema("TABLE_MAP for " + data.getDatabase() + "." + data.getTable(), e)) {
+					throw e;
+				}
+				retried = true;
+				tableCache.clear();
+			}
+		}
+	}
+
+	private boolean isMissingTableOrDatabase(RuntimeException e) {
+		String message = e.getMessage();
+		if (message == null) {
+			return false;
+		}
+		return message.startsWith("Couldn't find table") || message.startsWith("Couldn't find database");
 	}
 
 	private void processQueryEvent(BinlogConnectorEvent event) throws Exception {
@@ -588,8 +656,7 @@ public class BinlogConnectorReplicator extends RunLoopProcess implements Replica
 					}
 					break;
 				case TABLE_MAP:
-					TableMapEventData data = event.tableMapData();
-					tableCache.processEvent(getSchema(), this.filter, this.ignoreMissingSchema, data.getTableId(), data.getDatabase(), data.getTable());
+					processTableMapEvent(event);
 					break;
 				case ROWS_QUERY:
 					RowsQueryEventData rqed = event.getEvent().getData();
@@ -716,8 +783,7 @@ public class BinlogConnectorReplicator extends RunLoopProcess implements Replica
 					rowBuffer = getTransactionRows(event);
 					break;
 				case TABLE_MAP:
-					TableMapEventData data = event.tableMapData();
-					tableCache.processEvent(getSchema(), this.filter,this.ignoreMissingSchema, data.getTableId(), data.getDatabase(), data.getTable());
+					processTableMapEvent(event);
 					break;
 				case QUERY:
 					QueryEventData qe = event.queryData();
