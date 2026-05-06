@@ -88,54 +88,56 @@ class BigQueryCallback implements ApiFutureCallback<AppendRowsResponse> {
 
   @Override
   public void onSuccess(AppendRowsResponse response) {
-    for (int i = 0; i < appendContext.callbacks.size(); i++) {
+    int batchSize = appendContext.callbacks.size();
+    LOGGER.info("[bq-callback] worker={} batch SUCCESS: {} rows acknowledged, position={}",
+        parent.getWorkerId(), batchSize, this.position);
+    for (int i = 0; i < batchSize; i++) {
         this.succeededMessageCount.inc();
         this.succeededMessageMeter.mark();
         AbstractAsyncProducer.CallbackCompleter cc = (AbstractAsyncProducer.CallbackCompleter) appendContext.callbacks.get(i);
         cc.markCompleted();
-
-        if (LOGGER.isDebugEnabled()) {
-          try {
-            LOGGER.debug("Worker {} -> {}\n", parent.getWorkerId(), this.position);
-          } catch (Exception e) {
-            e.printStackTrace();
-          }
-        }
     }
   }
 
   @Override
   public void onFailure(Throwable t) {
-    for (int i = 0; i < appendContext.callbacks.size(); i++) {
+    int batchSize = appendContext.callbacks.size();
+    for (int i = 0; i < batchSize; i++) {
         this.failedMessageCount.inc();
         this.failedMessageMeter.mark();
     }
 
-    LOGGER.error("Worker {} " + t.getClass().getSimpleName() + " @ " + position, parent.getWorkerId());
-    LOGGER.error("Worker {} " + t.getLocalizedMessage(), parent.getWorkerId());
-
     Status status = Status.fromThrowable(t);
+    LOGGER.error("[bq-callback] worker={} batch FAILED: {} rows, status={} ({}), position={}, retryCount={}/{}",
+        parent.getWorkerId(), batchSize, status.getCode(), t.getClass().getSimpleName(),
+        position, appendContext.retryCount, MAX_RETRY_COUNT);
+    LOGGER.error("[bq-callback] worker={} failure detail: {}", parent.getWorkerId(), t.getLocalizedMessage(), t);
+
     if (appendContext.retryCount < MAX_RETRY_COUNT
         && RETRIABLE_ERROR_CODES.contains(status.getCode())) {
       appendContext.retryCount++;
+      LOGGER.warn("[bq-callback] worker={} retrying batch (attempt {}/{})",
+          parent.getWorkerId(), appendContext.retryCount, MAX_RETRY_COUNT);
       try {
         this.parent.attemptBatch(appendContext);
         return;
       } catch (Exception e) {
-        System.out.format("Worker {} Failed to retry append: %s\n", parent.getWorkerId(), e);
+        LOGGER.error("[bq-callback] worker={} retry attempt failed: {}", parent.getWorkerId(), e.getMessage(), e);
       }
     }
 
     synchronized (this.parent.getLock()) {
       if (this.parent.getError() == null && !this.context.getConfig().ignoreProducerError) {
+        LOGGER.error("[bq-callback] worker={} fatal error, terminating Maxwell. ignoreProducerError=false", parent.getWorkerId());
         StorageException storageException = Exceptions.toStorageException(t);
         this.parent.setError((storageException != null) ? storageException : new RuntimeException(t));
         context.terminate();
         return;
       }
     }
-    // got an error, but we are ingoring producer error
-    for (int i = 0; i < appendContext.callbacks.size(); i++) {
+    LOGGER.warn("[bq-callback] worker={} ignoring batch failure (ignoreProducerError=true), marking {} rows complete",
+        parent.getWorkerId(), batchSize);
+    for (int i = 0; i < batchSize; i++) {
         AbstractAsyncProducer.CallbackCompleter cc = (AbstractAsyncProducer.CallbackCompleter) appendContext.callbacks.get(i);
         cc.markCompleted();
     }
@@ -155,7 +157,10 @@ public class MaxwellBigQueryProducer extends AbstractProducer {
       throws IOException {
     super(context);
     bigqueryThreads = Math.max(1, bigqueryThreads);
-    this.queue = new ArrayBlockingQueue<>(bigqueryThreads * MaxwellBigQueryProducerWorker.BATCH_SIZE);
+    int queueCapacity = bigqueryThreads * MaxwellBigQueryProducerWorker.BATCH_SIZE;
+    LOGGER.info("[bq-producer] initializing: project={}, dataset={}, table={}, threads={}, queueCapacity={}",
+        bigQueryProjectId, bigQueryDataset, bigQueryTable, bigqueryThreads, queueCapacity);
+    this.queue = new ArrayBlockingQueue<>(queueCapacity);
 
     ThreadFactory workerThreadFactory = new ThreadFactoryBuilder().setNameFormat("bq-worker-%d").setDaemon(true).build();
     this.workerExecutor = Executors.newFixedThreadPool(bigqueryThreads, workerThreadFactory);
@@ -166,35 +171,40 @@ public class MaxwellBigQueryProducer extends AbstractProducer {
     this.workers = new ArrayList<>(bigqueryThreads);
     TableName tableName = TableName.of(bigQueryProjectId, bigQueryDataset, bigQueryTable);
     startWorkers(context, tableName);
+    LOGGER.info("[bq-producer] fully initialized with {} worker(s)", this.workers.size());
   }
 
   private void startWorkers(MaxwellContext context, TableName tableName) throws IOException {
     int numWorkers = this.workers.size();
     TableSchema tableSchema = getTableSchema(tableName);
-     // Create and start workers
     for (int i = 0; i < Math.max(1, numWorkers); i++) {
+       LOGGER.info("[bq-producer] initializing worker {}", i);
        try {
             MaxwellBigQueryProducerWorker worker = new MaxwellBigQueryProducerWorker(
                 context,
                 this.queue,
-                this.callbackExecutor, // Pass callback executor
-                i // Pass worker ID
+                this.callbackExecutor,
+                i
             );
             worker.initialize(tableName, tableSchema);
             this.workers.add(worker);
             this.workerExecutor.submit(worker);
+            LOGGER.info("[bq-producer] worker {} started and submitted to executor", i);
        } catch (DescriptorValidationException | IOException | InterruptedException e) {
-           LOGGER.error("Failed to initialize MaxwellBigQueryProducer worker {}: {}", i, e.getMessage(), e);
-           // Don't try to shutdown executors, just throw
+           LOGGER.error("[bq-producer] failed to initialize worker {}: {}", i, e.getMessage(), e);
            throw new IOException("Failed to initialize worker " + i, e);
        }
     }
-    LOGGER.info("Submitted {} workers to executor.", this.workers.size());
+    LOGGER.info("[bq-producer] {} worker(s) submitted to executor", this.workers.size());
   }
 
   private TableSchema getTableSchema(TableName tName) throws IOException {
+    LOGGER.info("[bq-producer] fetching BigQuery table schema: {}", tName);
     BigQuery bigquery = BigQueryOptions.newBuilder().setProjectId(tName.getProject()).build().getService();
     Table table = bigquery.getTable(tName.getDataset(), tName.getTable());
+    if ( table == null ) {
+      throw new IOException("[bq-producer] BigQuery table not found: " + tName);
+    }
     Schema schema = table.getDefinition().getSchema();
     // Filter out bq_inserted_at column from the schema
     List<com.google.cloud.bigquery.Field> filteredFields = schema.getFields().stream()
@@ -202,12 +212,25 @@ public class MaxwellBigQueryProducer extends AbstractProducer {
       .collect(Collectors.toList());
     Schema filteredSchema = Schema.of(filteredFields);
     TableSchema tableSchema = BqToBqStorageSchemaConverter.convertTableSchema(filteredSchema);
+    LOGGER.info("[bq-producer] schema fetched for {}: {} fields (after filtering bq_inserted_at)",
+        tName, filteredFields.size());
     return tableSchema;
   }
 
+  private static final long PUSH_QUEUE_WARN_MS = 5_000;
+
   @Override
   public void push(RowMap r) throws Exception {
-    this.queue.put(r);
+    if ( !this.queue.offer(r) ) {
+      long waitStart = System.currentTimeMillis();
+      LOGGER.warn("[bq-producer] row queue is full (capacity={}), blocking until a worker drains it. db={} table={}",
+          this.queue.size() + this.queue.remainingCapacity(), r.getDatabase(), r.getTable());
+      this.queue.put(r);
+      long waitMs = System.currentTimeMillis() - waitStart;
+      if ( waitMs > PUSH_QUEUE_WARN_MS ) {
+        LOGGER.warn("[bq-producer] unblocked after {}ms waiting for queue space", waitMs);
+      }
+    }
   }
 }
 class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Runnable, StoppableTask {
@@ -377,11 +400,14 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
 
   public void initialize(TableName tName, TableSchema tableSchema)
       throws DescriptorValidationException, IOException, InterruptedException {
+    LOGGER.info("[bq-worker-{}] initializing JsonStreamWriter for table={}", workerId, tName);
     this.streamWriter = JsonStreamWriter.newBuilder(tName.toString(), tableSchema).build();
+    LOGGER.info("[bq-worker-{}] JsonStreamWriter ready", workerId);
   }
 
   @Override
   public void requestStop() throws Exception {
+    LOGGER.info("[bq-worker-{}] stop requested", workerId);
     taskState.requestStop();
     streamWriter.close();
     scheduledExecutor.shutdown();
@@ -390,6 +416,7 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
         throw this.error;
       }
     }
+    LOGGER.info("[bq-worker-{}] stopped", workerId);
   }
 
   @Override
@@ -400,15 +427,25 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
   @Override
   public void run() {
     this.thread = Thread.currentThread();
+    LOGGER.info("[bq-worker-{}] run loop started", workerId);
+    long rowsProcessed = 0;
     while (true) {
       try {
         RowMap row = queue.take();
         if (!taskState.isRunning()) {
+          LOGGER.info("[bq-worker-{}] stop flag set, exiting run loop after {} rows", workerId, rowsProcessed);
           taskState.stopped();
           return;
         }
         this.push(row);
+        rowsProcessed++;
+        if ( rowsProcessed % 10_000 == 0 ) {
+          LOGGER.info("[bq-worker-{}] progress: {} rows sent to BQ, queue remaining={}",
+              workerId, rowsProcessed, queue.size());
+        }
       } catch (Exception e) {
+        LOGGER.error("[bq-worker-{}] exception in run loop after {} rows, terminating Maxwell: {}",
+            workerId, rowsProcessed, e.getMessage(), e);
         taskState.stopped();
         context.terminate(e);
         return;
@@ -418,6 +455,8 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
 
   @Override
   public void sendAsync(RowMap r, CallbackCompleter cc) throws Exception {
+    LOGGER.debug("[bq-worker-{}] sendAsync: type={} db={} table={} position={}",
+        workerId, r.getRowType(), r.getDatabase(), r.getTable(), r.getNextPosition());
 
     JSONObject record = new JSONObject(r.toJSON(outputConfig));
     applyColumnTransformations(r, record);
@@ -425,7 +464,7 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
 
     int recordSize = AppendContext.getJsonByteSize(record);
     if (recordSize >= 9 * 1024 * 1024) {
-        LOGGER.error("Worker {} skipping oversized record: {} bytes for table {}.{}, position {}",
+        LOGGER.error("[bq-worker-{}] skipping oversized record: {} bytes for table {}.{}, position {}",
             this.workerId, recordSize, r.getDatabase(), r.getTable(), r.getNextPosition());
         cc.markCompleted();
         return;
@@ -444,8 +483,15 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
 
     this.appendContext.addRow(r, record, cc);
 
-    if(this.appendContext.callbacks.size() >= BATCH_SIZE
-       || this.appendContext.getApproximateSize() >= MAX_MESSAGE_SIZE_BYTES) {
+    int currentBatchSize = this.appendContext.callbacks.size();
+    long currentBatchBytes = this.appendContext.getApproximateSize();
+    LOGGER.debug("[bq-worker-{}] append context: {}/{} rows, {}/{} bytes",
+        workerId, currentBatchSize, BATCH_SIZE, currentBatchBytes, MAX_MESSAGE_SIZE_BYTES);
+
+    if(currentBatchSize >= BATCH_SIZE || currentBatchBytes >= MAX_MESSAGE_SIZE_BYTES) {
+        LOGGER.info("[bq-worker-{}] flushing full batch: {} rows, ~{} bytes (trigger: {})",
+            workerId, currentBatchSize, currentBatchBytes,
+            currentBatchSize >= BATCH_SIZE ? "row count" : "size limit");
         synchronized (this.getLock()) {
             this.attemptBatch(this.appendContext);
             this.appendContext = null;
@@ -457,6 +503,9 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
     if(appendContext.scheduledTask != null && !appendContext.scheduledTask.isDone()) {
       appendContext.scheduledTask.cancel(false);
     }
+    LOGGER.info("[bq-worker-{}] attempting to send batch: {} rows, ~{} bytes, retryCount={}, position={}",
+        workerId, appendContext.callbacks.size(), appendContext.getApproximateSize(),
+        appendContext.retryCount, appendContext.position);
     ApiFuture<AppendRowsResponse> future = streamWriter.append(appendContext.data);
 
     ApiFutures.addCallback(
@@ -469,17 +518,24 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
 
 
   public void scheduleAttempt(final AppendContext appendContext) {
+    LOGGER.debug("[bq-worker-{}] scheduling batch flush in 1 minute (rows so far: {})",
+        workerId, appendContext.callbacks.size());
     appendContext.scheduledTask = this.scheduledExecutor.schedule(() -> {
       try {
         synchronized (this.getLock()) {
-          this.attemptBatch(this.appendContext);
-          this.appendContext = null; // Nullify after attempting via scheduler
+          if (this.appendContext != null) {
+            LOGGER.info("[bq-worker-{}] scheduled flush triggered: {} rows, ~{} bytes",
+                workerId, this.appendContext.callbacks.size(), this.appendContext.getApproximateSize());
+            this.attemptBatch(this.appendContext);
+            this.appendContext = null;
+          } else {
+            LOGGER.debug("[bq-worker-{}] scheduled flush found null appendContext (already flushed)", workerId);
+          }
         }
       } catch (Exception e) {
-        LOGGER.error("Error sending scheduled bigquery batch message");
-        e.printStackTrace();
+        LOGGER.error("[bq-worker-{}] error in scheduled batch flush: {}", workerId, e.getMessage(), e);
       }
-    }, 1, TimeUnit.MINUTES); // 1 minute delay
+    }, 1, TimeUnit.MINUTES);
   }
 
   private void applyColumnTransformations(RowMap row, JSONObject record) {

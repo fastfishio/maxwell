@@ -30,6 +30,7 @@ public class PositionStoreThread extends RunLoopProcess implements Runnable {
 	}
 
 	public void start() {
+		LOGGER.info("[position-store] starting position flush thread");
 		this.thread = new Thread(this, "Position Flush Thread");
 		this.thread.setDaemon(true);
 		thread.start();
@@ -37,12 +38,15 @@ public class PositionStoreThread extends RunLoopProcess implements Runnable {
 
 	@Override
 	public void run() {
+		LOGGER.info("[position-store] thread running");
 		try {
 			runLoop();
 		} catch ( Exception e ) {
+			LOGGER.error("[position-store] thread error, terminating Maxwell: {}", e.getMessage(), e);
 			this.exception = e;
 			context.terminate(e);
 		} finally {
+			LOGGER.info("[position-store] thread stopped. last stored position: {}", storedPosition);
 			this.taskState.stopped();
 		}
 	}
@@ -91,21 +95,33 @@ public class PositionStoreThread extends RunLoopProcess implements Runnable {
 		return false;
 	}
 
+	private long lastPositionLogAt = 0;
+	private static final long POSITION_LOG_INTERVAL_MS = 60_000;
+
 	public void work() throws Exception {
 		Position newPosition = position;
 
 		if ( newPosition != null && newPosition.newerThan(storedPosition) ) {
+			LOGGER.debug("[position-store] flushing position to DB: {}", newPosition);
 			store.set(newPosition);
 			storedPosition = newPosition;
+
+			long now = System.currentTimeMillis();
+			if ( now - lastPositionLogAt >= POSITION_LOG_INTERVAL_MS ) {
+				LOGGER.info("[position-store] position checkpoint: {}", storedPosition);
+				lastPositionLogAt = now;
+			}
 		}
 
 		try { Thread.sleep(1000); } catch (InterruptedException e) { }
 
 		if ( shouldHeartbeat(newPosition) )  {
+			LOGGER.debug("[position-store] sending heartbeat from position={}", newPosition);
 			lastHeartbeatSent = store.heartbeat();
 			if (newPosition != null) {
 				lastHeartbeatSentFrom = newPosition.getBinlogPosition();
 			}
+			LOGGER.debug("[position-store] heartbeat sent: {}", lastHeartbeatSent);
 		}
 	}
 

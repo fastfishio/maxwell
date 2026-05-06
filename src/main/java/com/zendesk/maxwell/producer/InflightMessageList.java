@@ -12,8 +12,12 @@ import com.zendesk.maxwell.replication.Position;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.concurrent.Semaphore;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class InflightMessageList {
+	private static final Logger LOGGER = LoggerFactory.getLogger(InflightMessageList.class);
+
 	class InflightMessage {
 		public final Position position;
 		public boolean isComplete;
@@ -87,9 +91,6 @@ public class InflightMessageList {
 	private void checkStuckHead(long messageID) {
 		// If the head is stuck for the length of time (configurable)
 		// we assume the head will unlikely get acknowledged, hence terminate Maxwell.
-		// This gatekeeper is the last resort since if anything goes wrong,
-		// producer should have raised exceptions earlier, but sometimes kafka just goes to lunch and eats
-		// a message entirely
 
 		if (producerAckTimeoutMS ==  0)
 			return;
@@ -98,12 +99,20 @@ public class InflightMessageList {
 		if ( message == null || message.messageID == messageID )
 			return;
 
-		if ( message.timeAsBlockedHead() > producerAckTimeoutMS ) {
+		long blockedForMs = message.timeAsBlockedHead();
+		if ( blockedForMs > producerAckTimeoutMS ) {
+			LOGGER.error("[inflight] head of inflight list has been stuck for {}ms (timeout={}ms), terminating Maxwell. position={} messageID={}",
+				blockedForMs, producerAckTimeoutMS, message.position, message.messageID);
+			LOGGER.error("[inflight] inflight list size={} at time of termination", this.linkedMap.size());
 			IllegalStateException e = new IllegalStateException(
 				"Did not receive acknowledgement for the head of the inflight message list for " + producerAckTimeoutMS + " ms"
 			);
 			context.terminate(e);
 		} else {
+			if ( blockedForMs > producerAckTimeoutMS / 2 ) {
+				LOGGER.warn("[inflight] head of inflight list has been blocked for {}ms (timeout={}ms), position={} inflightSize={}",
+					blockedForMs, producerAckTimeoutMS, message.position, this.linkedMap.size());
+			}
 			message.markBlockedHead();
 		}
 	}
@@ -127,6 +136,7 @@ public class InflightMessageList {
 		m.isComplete = true;
 
 		InflightMessage completeUntil = null;
+		int drained = 0;
 		Iterator<InflightMessage> iterator = iterator();
 
 		while ( iterator.hasNext() ) {
@@ -137,6 +147,12 @@ public class InflightMessageList {
 
 			completeUntil = msg;
 			iterator.remove();
+			drained++;
+		}
+
+		if ( drained > 0 ) {
+			LOGGER.debug("[inflight] drained {} completed messages, position advanced to={}, remaining={}",
+				drained, completeUntil != null ? completeUntil.position : "none", this.linkedMap.size());
 		}
 
 		return completeUntil;

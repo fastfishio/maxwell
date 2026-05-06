@@ -46,8 +46,15 @@ public class BinlogConnectorReplicator extends RunLoopProcess implements Replica
 	public static final int BAD_BINLOG_ERROR_CODE = 1236;
 	public static final int ACCESS_DENIED_ERROR_CODE = 1227;
 
+	private long totalRowsProcessed = 0;
+	private long lastProgressLogAt = System.currentTimeMillis();
+	private static final long PROGRESS_LOG_INTERVAL_MS = 60_000;
+	private long noEventStreak = 0;
+	private static final long NO_EVENT_WARN_THRESHOLD = 300; // 300 * 100ms poll = 30 seconds
+
 	private final String clientID;
 	private final String maxwellSchemaDatabaseName;
+	private final String replicationHost;
 
 	protected final BinaryLogClient client;
 	private final int replicationReconnectionRetries;
@@ -149,6 +156,7 @@ public class BinlogConnectorReplicator extends RunLoopProcess implements Replica
 		int binlogEventQueueSize
 	) {
 		this.clientID = clientID;
+		this.replicationHost = mysqlConfig.host + ":" + mysqlConfig.port;
 		this.bootstrapper = bootstrapper;
 		this.maxwellSchemaDatabaseName = maxwellSchemaDatabaseName;
 		this.producer = producer;
@@ -241,6 +249,14 @@ public class BinlogConnectorReplicator extends RunLoopProcess implements Replica
 
 		rowCounter.inc();
 		rowMeter.mark();
+		totalRowsProcessed++;
+
+		long now = System.currentTimeMillis();
+		if ( now - lastProgressLogAt >= PROGRESS_LOG_INTERVAL_MS ) {
+			LOGGER.info("[replicator] progress: {} total rows processed, queue size={}, connected={}",
+				totalRowsProcessed, queue.size(), isConnected);
+			lastProgressLogAt = now;
+		}
 
 		if ( scripting != null && !isMaxwellRow(row))
 			scripting.invoke(row);
@@ -250,12 +266,16 @@ public class BinlogConnectorReplicator extends RunLoopProcess implements Replica
 
 	private boolean replicatorStarted = false;
 	public void startReplicator() throws Exception {
+		LOGGER.info("[replicator] connecting to binlog: host={}, gtidMode={}, serverID={}",
+			replicationHost, gtidPositioning, client.getServerId());
 		this.client.connect(5000);
 		replicatorStarted = true;
+		LOGGER.info("[replicator] binlog client connected successfully");
 	}
 
 	@Override
 	protected void beforeStop() throws Exception {
+		LOGGER.info("[replicator] stopping: total rows processed={}, queue remaining={}", totalRowsProcessed, queue.size());
 		this.binlogEventListener.stop();
 		this.client.disconnect();
 	}
@@ -336,17 +356,20 @@ public class BinlogConnectorReplicator extends RunLoopProcess implements Replica
 
 	protected void processRow(RowMap row) throws Exception {
 		if ( row instanceof HeartbeatRowMap) {
+			LOGGER.debug("[replicator] pushing heartbeat at position={}", row.getPosition());
 			producer.push(row);
 			if (stopAtHeartbeat != null) {
 				long thisHeartbeat = row.getPosition().getLastHeartbeatRead();
 				if (thisHeartbeat >= stopAtHeartbeat) {
-					LOGGER.info("received final heartbeat " + thisHeartbeat + "; stopping replicator");
-					// terminate runLoop
+					LOGGER.info("[replicator] received final heartbeat {}; stopping replicator", thisHeartbeat);
 					this.taskState.stopped();
 				}
 			}
-		} else if ( !shouldSkipRow(row) )
+		} else if ( !shouldSkipRow(row) ) {
+			LOGGER.debug("[replicator] pushing row: type={} db={} table={} position={}",
+				row.getRowType(), row.getDatabase(), row.getTable(), row.getNextPosition());
 			producer.push(row);
+		}
 	}
 
 
@@ -382,6 +405,7 @@ public class BinlogConnectorReplicator extends RunLoopProcess implements Replica
 	 * @param timestamp The timestamp of the SQL binlog event
 	 */
 	private void processQueryEvent(String dbName, String sql, SchemaStore schemaStore, Position position, Position nextPosition, Long timestamp) throws Exception {
+		LOGGER.info("[replicator] processing DDL on db='{}' at position={}: {}", dbName, position, sql.length() > 200 ? sql.substring(0, 200) + "..." : sql);
 		List<ResolvedSchemaChange> changes = schemaStore.processSQL(sql, dbName, position);
 		Long schemaId = getSchemaId();
 
@@ -514,11 +538,16 @@ public class BinlogConnectorReplicator extends RunLoopProcess implements Replica
 
 		while ((reconnectionAttempts += 1) <= this.replicationReconnectionRetries || this.replicationReconnectionRetries == 0) {
 			try {
-				LOGGER.info(String.format("Reconnection attempt: %s of %s", reconnectionAttempts, replicationReconnectionRetries > 0 ? this.replicationReconnectionRetries : "unlimited"));
+				LOGGER.info("[replicator] reconnection attempt {} of {}", reconnectionAttempts,
+					replicationReconnectionRetries > 0 ? this.replicationReconnectionRetries : "unlimited");
 				client.connect(5000);
+				LOGGER.info("[replicator] reconnected successfully on attempt {}", reconnectionAttempts);
 				return;
-			} catch (IOException | TimeoutException ignored) { }
+			} catch (IOException | TimeoutException e) {
+				LOGGER.warn("[replicator] reconnection attempt {} failed: {}", reconnectionAttempts, e.getMessage());
+			}
 		}
+		LOGGER.error("[replicator] exhausted all {} reconnection attempts, giving up", replicationReconnectionRetries);
 		throw new TimeoutException("Maximum reconnection attempts reached.");
 	}
 
@@ -537,6 +566,10 @@ public class BinlogConnectorReplicator extends RunLoopProcess implements Replica
 	private RowMapBuffer getTransactionRows(BinlogConnectorEvent beginEvent) throws Exception {
 		BinlogConnectorEvent event;
 		RowMapBuffer buffer = new RowMapBuffer(MAX_TX_ELEMENTS, this.bufferMemoryUsage);
+		long txStartMs = System.currentTimeMillis();
+		int nullEventCount = 0;
+
+		LOGGER.debug("[replicator] BEGIN transaction at position={}", beginEvent.getPosition().fullPosition());
 
 		String currentQuery = null;
 
@@ -544,6 +577,12 @@ public class BinlogConnectorReplicator extends RunLoopProcess implements Replica
 			event = pollEvent();
 
 			if (event == null) {
+				nullEventCount++;
+				if ( nullEventCount % 100 == 0 ) {
+					long stuckMs = System.currentTimeMillis() - txStartMs;
+					LOGGER.warn("[replicator] transaction has been open for {}ms with {} rows buffered, still waiting for COMMIT. position={}",
+						stuckMs, buffer.size(), beginEvent.getPosition().fullPosition());
+				}
 				ensureReplicatorThread();
 				continue;
 			}
@@ -555,6 +594,12 @@ public class BinlogConnectorReplicator extends RunLoopProcess implements Replica
 					long timeSpent = buffer.getLast().getTimestampMillis() - beginEvent.getEvent().getHeader().getTimestamp();
 					transactionExecutionTime.update(timeSpent);
 					transactionRowCount.update(buffer.size());
+					LOGGER.debug("[replicator] COMMIT transaction: {} rows, {}ms to complete, position={}",
+						buffer.size(), System.currentTimeMillis() - txStartMs, event.getPosition().fullPosition());
+					if ( buffer.size() > 1000 ) {
+						LOGGER.info("[replicator] large transaction committed: {} rows at position={}",
+							buffer.size(), event.getPosition().fullPosition());
+					}
 				}
 				if(eventType == EventType.XID) {
 					buffer.setXid(event.xidData().getXid());
@@ -771,7 +816,17 @@ public class BinlogConnectorReplicator extends RunLoopProcess implements Replica
 	}
 
 	protected BinlogConnectorEvent pollEvent() throws InterruptedException {
-		return queue.poll(100, TimeUnit.MILLISECONDS);
+		BinlogConnectorEvent event = queue.poll(100, TimeUnit.MILLISECONDS);
+		if ( event == null ) {
+			noEventStreak++;
+			if ( noEventStreak == NO_EVENT_WARN_THRESHOLD || noEventStreak % (NO_EVENT_WARN_THRESHOLD * 2) == 0 ) {
+				LOGGER.warn("[replicator] no binlog events received for ~{}s, queue size={}, connected={}",
+					noEventStreak / 10, queue.size(), isConnected);
+			}
+		} else {
+			noEventStreak = 0;
+		}
+		return event;
 	}
 
 	public Schema getSchema() throws SchemaStoreException {

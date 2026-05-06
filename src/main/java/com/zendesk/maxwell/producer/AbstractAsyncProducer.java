@@ -1,15 +1,18 @@
 package com.zendesk.maxwell.producer;
 
 import com.codahale.metrics.Gauge;
-import com.zendesk.maxwell.MaxwellConfig;
 import com.zendesk.maxwell.MaxwellContext;
 import com.zendesk.maxwell.monitoring.Metrics;
 import com.zendesk.maxwell.replication.Position;
 import com.zendesk.maxwell.row.RowMap;
 
 import java.util.concurrent.TimeUnit;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public abstract class AbstractAsyncProducer extends AbstractProducer {
+	private static final Logger LOGGER = LoggerFactory.getLogger(AbstractAsyncProducer.class);
+	private static final long SLOT_WAIT_WARN_MS = 5_000;
 
 	public class CallbackCompleter {
 		private InflightMessageList inflightMessages;
@@ -66,8 +69,10 @@ public abstract class AbstractAsyncProducer extends AbstractProducer {
 	@Override
 	public final void push(RowMap r) throws Exception {
 		Position position = r.getNextPosition();
-		// Rows that do not get sent to the prodcuer will be automatically marked as complete.
+		// Rows that do not get sent to the producer will be automatically marked as complete.
 		if(!r.shouldOutput(outputConfig)) {
+			LOGGER.debug("[async-producer] skipping row (shouldOutput=false): db={} table={} type={}",
+				r.getDatabase(), r.getTable(), r.getRowType());
 			if ( position != null ) {
 				inflightMessages.addMessage(position, r.getTimestampMillis(), 0L);
 
@@ -79,9 +84,19 @@ public abstract class AbstractAsyncProducer extends AbstractProducer {
 			return;
 		}
 
-		// back-pressure from slow producers
+		// back-pressure: if the inflight list is at capacity, waitForSlot blocks
+		int inflightSize = inflightMessages.size();
+		if ( inflightSize > 5000 ) {
+			LOGGER.warn("[async-producer] high inflight message count: {} messages pending. Producer may be slow or stuck.", inflightSize);
+		}
 
+		long slotWaitStart = System.currentTimeMillis();
 		long messageID = inflightMessages.waitForSlot();
+		long slotWaitMs = System.currentTimeMillis() - slotWaitStart;
+		if ( slotWaitMs > SLOT_WAIT_WARN_MS ) {
+			LOGGER.warn("[async-producer] waited {}ms for an inflight slot (capacity full). db={} table={} inflightSize={}",
+				slotWaitMs, r.getDatabase(), r.getTable(), inflightMessages.size());
+		}
 
 		if(r.isTXCommit()) {
 			inflightMessages.addMessage(position, r.getTimestampMillis(), messageID);

@@ -18,6 +18,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 class BinlogConnectorEventListener implements BinaryLogClient.EventListener {
 	private static final Logger LOGGER = LoggerFactory.getLogger(BinlogConnectorEventListener.class);
+	private static final long LAG_WARN_THRESHOLD_MS = 30_000;
+	private static final long QUEUE_FULL_LOG_INTERVAL_MS = 5_000;
 
 	private final BlockingQueue<BinlogConnectorEvent> queue;
 	private final Timer queueTimer;
@@ -26,6 +28,8 @@ class BinlogConnectorEventListener implements BinaryLogClient.EventListener {
 	private final MaxwellOutputConfig outputConfig;
 	private long replicationLag;
 	private String gtid;
+	private long lastQueueFullLogAt = 0;
+	private long queueFullOfferCount = 0;
 
 	public BinlogConnectorEventListener(
 		BinaryLogClient client,
@@ -65,12 +69,29 @@ class BinlogConnectorEventListener implements BinaryLogClient.EventListener {
 			trackMetrics = true;
 			eventSeenAt = System.currentTimeMillis();
 			replicationLag = eventSeenAt - event.getHeader().getTimestamp();
+			if ( replicationLag > LAG_WARN_THRESHOLD_MS ) {
+				LOGGER.warn("[event-listener] high replication lag detected: {}ms ({}s)", replicationLag, replicationLag / 1000);
+			}
 		}
 
 		while (mustStop.get() != true) {
 			try {
 				if ( queue.offer(ep, 100, TimeUnit.MILLISECONDS ) ) {
+					if ( queueFullOfferCount > 0 ) {
+						LOGGER.info("[event-listener] queue unblocked after {} failed offers, current queue size={}",
+							queueFullOfferCount, queue.size());
+						queueFullOfferCount = 0;
+					}
 					break;
+				} else {
+					queueFullOfferCount++;
+					long now = System.currentTimeMillis();
+					if ( now - lastQueueFullLogAt >= QUEUE_FULL_LOG_INTERVAL_MS ) {
+						LOGGER.warn("[event-listener] replication event queue is full (capacity={}, size={}), producer may be stuck. Blocked for ~{}ms on event type={}",
+							queue.size() + queue.remainingCapacity(), queue.size(),
+							queueFullOfferCount * 100L, eventType);
+						lastQueueFullLogAt = now;
+					}
 				}
 			} catch (InterruptedException e) {
 				return;

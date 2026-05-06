@@ -153,13 +153,21 @@ public class Maxwell implements Runnable {
 	 */
 	protected Position getInitialPosition() throws Exception {
 		/* first method:  do we have a stored position for this server? */
+		LOGGER.info("[maxwell] looking up stored position for clientID={}", config.clientID);
 		Position initial = this.context.getInitialPosition();
+
+		if (initial != null) {
+			LOGGER.info("[maxwell] resuming from stored position: {}", initial);
+		}
 
 		if (initial == null) {
 
 			/* second method: are we recovering from a master swap? */
 			if ( config.masterRecovery ) {
+				LOGGER.info("[maxwell] no stored position found, attempting master recovery");
 				initial = attemptMasterRecovery();
+				if ( initial != null )
+					LOGGER.info("[maxwell] master recovery position: {}", initial);
 			}
 
 			/* third method: is there a previous client_id?
@@ -169,15 +177,17 @@ public class Maxwell implements Runnable {
 			if ( initial == null ) {
 				initial = this.context.getOtherClientPosition();
 				if ( initial != null ) {
-					LOGGER.info("Found previous client position: " + initial);
+					LOGGER.info("[maxwell] found previous client position: {}", initial);
 				}
 			}
 
 			/* fourth method: capture the current master position. */
 			if ( initial == null ) {
+				LOGGER.info("[maxwell] no prior position found, capturing current master position");
 				try ( Connection c = context.getReplicationConnection() ) {
 					initial = Position.capture(c, config.gtidMode);
 				}
+				LOGGER.info("[maxwell] starting fresh at master position: {}", initial);
 			}
 
 			/* if the initial position didn't come from the store, store it */
@@ -239,11 +249,13 @@ public class Maxwell implements Runnable {
 	}
 
 	private void startInner() throws Exception {
+		LOGGER.info("[maxwell] stage 1/6: verifying MySQL replication and Maxwell schema state");
 		try ( Connection connection = this.context.getReplicationConnection();
 		      Connection rawConnection = this.context.getRawMaxwellConnection() ) {
 			MaxwellMysqlStatus.ensureReplicationMysqlState(connection);
 			MaxwellMysqlStatus.ensureMaxwellMysqlState(rawConnection);
 			if (config.gtidMode) {
+				LOGGER.info("[maxwell] gtidMode=true, verifying GTID MySQL state");
 				MaxwellMysqlStatus.ensureGtidMysqlState(connection);
 			}
 
@@ -254,23 +266,32 @@ public class Maxwell implements Runnable {
 			}
 		}
 
+		LOGGER.info("[maxwell] stage 2/6: creating producer");
 		AbstractProducer producer = this.context.getProducer();
+		LOGGER.info("[maxwell] producer created: {}", producer.getClass().getSimpleName());
 
+		LOGGER.info("[maxwell] stage 3/6: determining initial replication position");
 		Position initPosition = getInitialPosition();
 		logBanner(producer, initPosition);
 		this.context.setPosition(initPosition);
+		LOGGER.info("[maxwell] initial position: {}", initPosition);
 
+		LOGGER.info("[maxwell] stage 4/6: loading schema store");
 		MysqlSchemaStore mysqlSchemaStore = new MysqlSchemaStore(this.context, initPosition);
 		BootstrapController bootstrapController = this.context.getBootstrapController(mysqlSchemaStore.getSchemaID());
 
 		this.context.startSchemaCompactor();
 
 		if (config.recaptureSchema) {
+			LOGGER.info("[maxwell] recaptureSchema=true, capturing full schema before starting");
 			mysqlSchemaStore.captureAndSaveSchema();
 		}
 
-		mysqlSchemaStore.getSchema(); // trigger schema to load / capture before we start the replicator.
+		LOGGER.info("[maxwell] triggering initial schema load");
+		mysqlSchemaStore.getSchema();
+		LOGGER.info("[maxwell] schema loaded, schemaID={}", mysqlSchemaStore.getSchemaID());
 
+		LOGGER.info("[maxwell] stage 5/6: creating replicator");
 		this.replicator = new BinlogConnectorReplicator(
 			mysqlSchemaStore,
 			producer,
@@ -295,6 +316,7 @@ public class Maxwell implements Runnable {
 		context.setReplicator(replicator);
 		this.context.start();
 
+		LOGGER.info("[maxwell] stage 6/6: starting replicator and entering run loop");
 		replicator.startReplicator();
 		this.onReplicatorStart();
 
@@ -303,6 +325,7 @@ public class Maxwell implements Runnable {
 		} catch ( ColumnDefCastException e ) {
 			logColumnCastError(e);
 		}
+		LOGGER.info("[maxwell] run loop exited normally");
 	}
 
 
