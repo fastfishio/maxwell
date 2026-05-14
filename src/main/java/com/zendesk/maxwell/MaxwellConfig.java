@@ -302,6 +302,26 @@ public class MaxwellConfig extends AbstractConfig {
 	 */
 	public String bigQueryTable;
 
+	/**
+	 * Optional BigQuery project for DDL metadata rows. Defaults to {@link #bigQueryProjectId} when unset.
+	 */
+	public String bigQueryDdlProjectId;
+
+	/**
+	 * When set with {@link #bigQueryDdlTable} and {@link #bigQueryDdlInstance}, DDL is appended to this dataset.
+	 */
+	public String bigQueryDdlDataset;
+
+	/**
+	 * BigQuery table id for DDL metadata (separate from {@link #bigQueryTable}).
+	 */
+	public String bigQueryDdlTable;
+
+	/**
+	 * Logical MySQL instance name stored in the DDL metadata table {@code instance} column.
+	 */
+	public String bigQueryDdlInstance;
+
 
 	public int bigQueryThreads;
 
@@ -915,6 +935,14 @@ public class MaxwellConfig extends AbstractConfig {
 				.withRequiredArg();
 		parser.accepts( "bigquery_threads", "number of threads to start to write data to bigquery" )
 				.withRequiredArg();
+		parser.accepts( "bigquery_ddl_project_id", "GCP project for the BigQuery DDL metadata table. default: bigquery_project_id" )
+				.withRequiredArg();
+		parser.accepts( "bigquery_ddl_dataset", "BigQuery dataset for DDL metadata rows (used with bigquery_ddl_table)" )
+				.withRequiredArg();
+		parser.accepts( "bigquery_ddl_table", "BigQuery table id for DDL metadata (separate from bigquery_table)" )
+				.withRequiredArg();
+		parser.accepts( "bigquery_ddl_instance", "value for the instance column in the DDL metadata table" )
+				.withRequiredArg();
 
 		parser.section( "pubsub" );
 		parser.accepts( "pubsub_project_id", "provide a google cloud platform project id associated with the pubsub topic" )
@@ -1087,6 +1115,10 @@ public class MaxwellConfig extends AbstractConfig {
 		this.bigQueryDataset		= fetchStringOption("bigquery_dataset", options, properties, null);
 		this.bigQueryTable			= fetchStringOption("bigquery_table", options, properties, null);
 		this.bigQueryThreads		= fetchIntegerOption("bigquery_threads", options, properties, 2);
+		this.bigQueryDdlProjectId	= fetchStringOption("bigquery_ddl_project_id", options, properties, null);
+		this.bigQueryDdlDataset		= fetchStringOption("bigquery_ddl_dataset", options, properties, null);
+		this.bigQueryDdlTable		= fetchStringOption("bigquery_ddl_table", options, properties, null);
+		this.bigQueryDdlInstance	= fetchStringOption("bigquery_ddl_instance", options, properties, null);
 
 		this.pubsubProjectId					= fetchStringOption("pubsub_project_id", options, properties, null);
 		this.pubsubTopic						= fetchStringOption("pubsub_topic", options, properties, "maxwell");

@@ -1,7 +1,6 @@
 package com.zendesk.maxwell.producer;
 
 import com.codahale.metrics.Gauge;
-import com.zendesk.maxwell.MaxwellConfig;
 import com.zendesk.maxwell.MaxwellContext;
 import com.zendesk.maxwell.monitoring.Metrics;
 import com.zendesk.maxwell.replication.Position;
@@ -63,11 +62,19 @@ public abstract class AbstractAsyncProducer extends AbstractProducer {
 
 	public abstract void sendAsync(RowMap r, CallbackCompleter cc) throws Exception;
 
+	/**
+	 * Whether this row should be handed to {@link #sendAsync}. Subclasses may override
+	 * (e.g. BigQuery DDL routed to a separate table without enabling global {@code output_ddl}).
+	 */
+	protected boolean shouldEnqueueRow(RowMap r) {
+		return r.shouldOutput(outputConfig);
+	}
+
 	@Override
 	public final void push(RowMap r) throws Exception {
 		Position position = r.getNextPosition();
 		// Rows that do not get sent to the prodcuer will be automatically marked as complete.
-		if(!r.shouldOutput(outputConfig)) {
+		if(!shouldEnqueueRow(r)) {
 			if ( position != null ) {
 				inflightMessages.addMessage(position, r.getTimestampMillis(), 0L);
 

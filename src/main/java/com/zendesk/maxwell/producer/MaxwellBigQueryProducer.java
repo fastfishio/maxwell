@@ -19,10 +19,10 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.util.concurrent.ThreadFactoryBuilder; // For naming threads
 import com.google.protobuf.Descriptors.DescriptorValidationException;
 import com.zendesk.maxwell.MaxwellContext;
-import com.zendesk.maxwell.monitoring.Metrics;
 import com.zendesk.maxwell.replication.Position;
 import com.zendesk.maxwell.row.RowMap;
 import com.zendesk.maxwell.schema.BqToBqStorageSchemaConverter;
+import com.zendesk.maxwell.schema.ddl.DDLMap;
 import com.zendesk.maxwell.util.StoppableTask;
 import com.zendesk.maxwell.util.StoppableTaskState;
 
@@ -30,14 +30,16 @@ import io.grpc.Status;
 import io.grpc.Status.Code;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Phaser;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadFactory;
@@ -151,11 +153,24 @@ public class MaxwellBigQueryProducer extends AbstractProducer {
   private final ExecutorService callbackExecutor;
 
   public MaxwellBigQueryProducer(MaxwellContext context, String bigQueryProjectId,
-      String bigQueryDataset, String bigQueryTable, int bigqueryThreads)
+      String bigQueryDataset, String bigQueryTable, int bigqueryThreads,
+      String bigQueryDdlProjectId, String bigQueryDdlDataset, String bigQueryDdlTable,
+      String bigQueryDdlInstance)
       throws IOException {
     super(context);
     bigqueryThreads = Math.max(1, bigqueryThreads);
     this.queue = new ArrayBlockingQueue<>(bigqueryThreads * MaxwellBigQueryProducerWorker.BATCH_SIZE);
+
+    boolean ddlPartial = (bigQueryDdlDataset != null && !bigQueryDdlDataset.isEmpty())
+        || (bigQueryDdlTable != null && !bigQueryDdlTable.isEmpty())
+        || (bigQueryDdlInstance != null && !bigQueryDdlInstance.isEmpty());
+    boolean ddlComplete = (bigQueryDdlDataset != null && !bigQueryDdlDataset.isEmpty())
+        && (bigQueryDdlTable != null && !bigQueryDdlTable.isEmpty())
+        && (bigQueryDdlInstance != null && !bigQueryDdlInstance.isEmpty());
+    if ( ddlPartial && !ddlComplete ) {
+      throw new IOException(
+          "bigquery_ddl_dataset, bigquery_ddl_table, and bigquery_ddl_instance must all be set to enable the BigQuery DDL metadata sink");
+    }
 
     ThreadFactory workerThreadFactory = new ThreadFactoryBuilder().setNameFormat("bq-worker-%d").setDaemon(true).build();
     this.workerExecutor = Executors.newFixedThreadPool(bigqueryThreads, workerThreadFactory);
@@ -165,44 +180,61 @@ public class MaxwellBigQueryProducer extends AbstractProducer {
 
     this.workers = new ArrayList<>(bigqueryThreads);
     TableName tableName = TableName.of(bigQueryProjectId, bigQueryDataset, bigQueryTable);
-    startWorkers(context, tableName);
+    TableName ddlTableName = null;
+    TableSchema ddlTableSchema = null;
+    if ( ddlComplete ) {
+      String ddlProject = (bigQueryDdlProjectId != null && !bigQueryDdlProjectId.isEmpty())
+          ? bigQueryDdlProjectId
+          : bigQueryProjectId;
+      ddlTableName = TableName.of(ddlProject, bigQueryDdlDataset, bigQueryDdlTable);
+      ddlTableSchema = getDdlMetadataTableSchema(ddlTableName);
+      LOGGER.info("[bq-producer] DDL metadata sink enabled: {}", ddlTableName);
+    }
+    startWorkers(context, tableName, ddlTableName, ddlTableSchema, ddlComplete, bigQueryDdlInstance, bigqueryThreads);
   }
 
-  private void startWorkers(MaxwellContext context, TableName tableName) throws IOException {
-    int numWorkers = this.workers.size();
+  private void startWorkers(MaxwellContext context, TableName tableName, TableName ddlTableName,
+      TableSchema ddlTableSchema, boolean ddlSinkEnabled, String ddlInstance, int bigqueryThreads) throws IOException {
     TableSchema tableSchema = getTableSchema(tableName);
-     // Create and start workers
-    for (int i = 0; i < Math.max(1, numWorkers); i++) {
-       try {
-            MaxwellBigQueryProducerWorker worker = new MaxwellBigQueryProducerWorker(
-                context,
-                this.queue,
-                this.callbackExecutor, // Pass callback executor
-                i // Pass worker ID
-            );
-            worker.initialize(tableName, tableSchema);
-            this.workers.add(worker);
-            this.workerExecutor.submit(worker);
-       } catch (DescriptorValidationException | IOException | InterruptedException e) {
-           LOGGER.error("Failed to initialize MaxwellBigQueryProducer worker {}: {}", i, e.getMessage(), e);
-           // Don't try to shutdown executors, just throw
-           throw new IOException("Failed to initialize worker " + i, e);
-       }
+    for (int i = 0; i < bigqueryThreads; i++) {
+      try {
+        MaxwellBigQueryProducerWorker worker = new MaxwellBigQueryProducerWorker(
+            context,
+            this.queue,
+            this.callbackExecutor,
+            i,
+            ddlSinkEnabled,
+            ddlInstance);
+        worker.initialize(tableName, tableSchema, ddlTableName, ddlTableSchema);
+        this.workers.add(worker);
+        this.workerExecutor.submit(worker);
+      } catch (DescriptorValidationException | IOException | InterruptedException e) {
+        LOGGER.error("Failed to initialize MaxwellBigQueryProducer worker {}: {}", i, e.getMessage(), e);
+        throw new IOException("Failed to initialize worker " + i, e);
+      }
     }
     LOGGER.info("Submitted {} workers to executor.", this.workers.size());
   }
 
-  private TableSchema getTableSchema(TableName tName) throws IOException {
+  private static TableSchema getTableSchema(TableName tName) throws IOException {
+    return getTableSchema(tName, Collections.emptySet());
+  }
+
+  private static TableSchema getDdlMetadataTableSchema(TableName tName) throws IOException {
+    return getTableSchema(tName, new HashSet<>(Arrays.asList("bq_created_at", "info")));
+  }
+
+  private static TableSchema getTableSchema(TableName tName, Set<String> skipExtraColumns) throws IOException {
     BigQuery bigquery = BigQueryOptions.newBuilder().setProjectId(tName.getProject()).build().getService();
     Table table = bigquery.getTable(tName.getDataset(), tName.getTable());
     Schema schema = table.getDefinition().getSchema();
-    // Filter out bq_inserted_at column from the schema
+    Set<String> skip = new HashSet<>(skipExtraColumns);
+    skip.add("bq_inserted_at");
     List<com.google.cloud.bigquery.Field> filteredFields = schema.getFields().stream()
-      .filter(field -> !"bq_inserted_at".equals(field.getName()))
+      .filter(field -> !skip.contains(field.getName()))
       .collect(Collectors.toList());
     Schema filteredSchema = Schema.of(filteredFields);
-    TableSchema tableSchema = BqToBqStorageSchemaConverter.convertTableSchema(filteredSchema);
-    return tableSchema;
+    return BqToBqStorageSchemaConverter.convertTableSchema(filteredSchema);
   }
 
   @Override
@@ -330,21 +362,28 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
   @GuardedBy("lock")
   private RuntimeException error = null;
   private JsonStreamWriter streamWriter;
+  private JsonStreamWriter ddlStreamWriter;
   private final ScheduledExecutorService scheduledExecutor;
   private final ExecutorService callbackExecutor;
   private final int workerId;
   private AppendContext appendContext;
+  private AppendContext ddlAppendContext;
+  private final boolean ddlSinkEnabled;
+  private final String ddlInstance;
 
   public MaxwellBigQueryProducerWorker(MaxwellContext context,
       ArrayBlockingQueue<RowMap> queue,
       ExecutorService callbackExecutor,
-      int workerId) throws IOException {
+      int workerId,
+      boolean ddlSinkEnabled,
+      String ddlInstance) throws IOException {
     super(context);
     this.queue = queue;
     this.callbackExecutor = callbackExecutor;
     this.workerId = workerId;
+    this.ddlSinkEnabled = ddlSinkEnabled;
+    this.ddlInstance = ddlInstance;
     this.scheduledExecutor = Executors.newSingleThreadScheduledExecutor(new ThreadFactoryBuilder().setNameFormat("bq-batch-scheduler-" + workerId).setDaemon(true).build());
-    Metrics metrics = context.getMetrics();
     this.taskState = new StoppableTaskState("MaxwellBigQueryProducerWorker-" + workerId); // Keep taskState init
   }
 
@@ -375,15 +414,31 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
   }
 
 
-  public void initialize(TableName tName, TableSchema tableSchema)
+  public void initialize(TableName mainTable, TableSchema mainSchema, TableName ddlTable, TableSchema ddlSchema)
       throws DescriptorValidationException, IOException, InterruptedException {
-    this.streamWriter = JsonStreamWriter.newBuilder(tName.toString(), tableSchema).build();
+    this.streamWriter = JsonStreamWriter.newBuilder(mainTable.toString(), mainSchema).build();
+    if ( ddlTable != null && ddlSchema != null ) {
+      this.ddlStreamWriter = JsonStreamWriter.newBuilder(ddlTable.toString(), ddlSchema).build();
+    }
+  }
+
+  @Override
+  protected boolean shouldEnqueueRow(RowMap r) {
+    if ( ddlSinkEnabled && r instanceof DDLMap ) {
+      MaxwellOutputConfig tmp = new MaxwellOutputConfig();
+      tmp.outputDDL = true;
+      return r.shouldOutput(tmp);
+    }
+    return super.shouldEnqueueRow(r);
   }
 
   @Override
   public void requestStop() throws Exception {
     taskState.requestStop();
     streamWriter.close();
+    if ( ddlStreamWriter != null ) {
+      ddlStreamWriter.close();
+    }
     scheduledExecutor.shutdown();
     synchronized (this.lock) {
       if (this.error != null) {
@@ -418,6 +473,10 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
 
   @Override
   public void sendAsync(RowMap r, CallbackCompleter cc) throws Exception {
+    if ( ddlSinkEnabled && r instanceof DDLMap ) {
+      sendDdlAsync((DDLMap) r, cc);
+      return;
+    }
 
     JSONObject record = new JSONObject(r.toJSON(outputConfig));
     applyColumnTransformations(r, record);
@@ -437,8 +496,8 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
       }
 
       if(this.appendContext == null) {
-        this.appendContext = new AppendContext();
-        this.scheduleAttempt(this.appendContext);
+        this.appendContext = new AppendContext(this.streamWriter, false);
+        this.scheduleFlush(this.appendContext);
       }
     }
 
@@ -453,11 +512,52 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
     }
   }
 
+  private void sendDdlAsync(DDLMap ddl, CallbackCompleter cc) throws Exception {
+    if ( ddlStreamWriter == null ) {
+      cc.markCompleted();
+      return;
+    }
+    Object typeObj = ddl.getChangeMap().get("type");
+    String changeType = typeObj != null ? typeObj.toString() : "unknown";
+    JSONObject record = new JSONObject();
+    record.put("instance", ddlInstance);
+    record.put("type", changeType);
+    record.put("statement", ddl.getSql() != null ? ddl.getSql() : JSONObject.NULL);
+
+    int recordSize = AppendContext.getJsonByteSize(record);
+    if (recordSize >= 9 * 1024 * 1024) {
+      LOGGER.error("Worker {} skipping oversized DDL record: {} bytes, position {}",
+          this.workerId, recordSize, ddl.getNextPosition());
+      cc.markCompleted();
+      return;
+    }
+
+    synchronized (this.lock) {
+      if (this.error != null) {
+        throw this.error;
+      }
+      if (this.ddlAppendContext == null) {
+        this.ddlAppendContext = new AppendContext(this.ddlStreamWriter, true);
+        this.scheduleFlush(this.ddlAppendContext);
+      }
+    }
+
+    this.ddlAppendContext.addRow(ddl, record, cc);
+
+    if (this.ddlAppendContext.callbacks.size() >= BATCH_SIZE
+        || this.ddlAppendContext.getApproximateSize() >= MAX_MESSAGE_SIZE_BYTES) {
+      synchronized (this.getLock()) {
+        this.attemptBatch(this.ddlAppendContext);
+        this.ddlAppendContext = null;
+      }
+    }
+  }
+
   public void attemptBatch(AppendContext appendContext) throws DescriptorValidationException, IOException {
     if(appendContext.scheduledTask != null && !appendContext.scheduledTask.isDone()) {
       appendContext.scheduledTask.cancel(false);
     }
-    ApiFuture<AppendRowsResponse> future = streamWriter.append(appendContext.data);
+    ApiFuture<AppendRowsResponse> future = appendContext.streamWriter.append(appendContext.data);
 
     ApiFutures.addCallback(
         future, new BigQueryCallback(this, appendContext,
@@ -468,18 +568,35 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
   }
 
 
-  public void scheduleAttempt(final AppendContext appendContext) {
-    appendContext.scheduledTask = this.scheduledExecutor.schedule(() -> {
+  private void scheduleFlush(final AppendContext ctx) {
+    if (ctx.scheduledTask != null && !ctx.scheduledTask.isDone()) {
+      ctx.scheduledTask.cancel(false);
+    }
+    ctx.scheduledTask = this.scheduledExecutor.schedule(() -> {
       try {
         synchronized (this.getLock()) {
-          this.attemptBatch(this.appendContext);
-          this.appendContext = null; // Nullify after attempting via scheduler
+          if ( ctx.forDdl ) {
+            if ( this.ddlAppendContext != ctx ) {
+              return;
+            }
+          } else if ( this.appendContext != ctx ) {
+            return;
+          }
+          if ( ctx.callbacks.isEmpty() ) {
+            return;
+          }
+          this.attemptBatch(ctx);
+          if ( ctx.forDdl ) {
+            this.ddlAppendContext = null;
+          } else {
+            this.appendContext = null;
+          }
         }
       } catch (Exception e) {
         LOGGER.error("Error sending scheduled bigquery batch message");
         e.printStackTrace();
       }
-    }, 1, TimeUnit.MINUTES); // 1 minute delay
+    }, 1, TimeUnit.MINUTES);
   }
 
   private void applyColumnTransformations(RowMap row, JSONObject record) {
@@ -612,8 +729,12 @@ class AppendContext {
   Position position;
   public ArrayList<AbstractAsyncProducer.CallbackCompleter> callbacks;
   public ScheduledFuture<?> scheduledTask;
+  final JsonStreamWriter streamWriter;
+  final boolean forDdl;
 
-  AppendContext() {
+  AppendContext(JsonStreamWriter streamWriter, boolean forDdl) {
+    this.streamWriter = streamWriter;
+    this.forDdl = forDdl;
     this.data = new JSONArray();
     this.retryCount = 0;
     this.records = 0;
