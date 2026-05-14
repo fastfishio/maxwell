@@ -308,7 +308,7 @@ public class MaxwellConfig extends AbstractConfig {
 	public String bigQueryDdlProjectId;
 
 	/**
-	 * When set with {@link #bigQueryDdlTable} and {@link #bigQueryDdlInstance}, DDL is appended to this dataset.
+	 * When set with {@link #bigQueryDdlTable}, DDL is appended to this dataset.
 	 */
 	public String bigQueryDdlDataset;
 
@@ -318,9 +318,15 @@ public class MaxwellConfig extends AbstractConfig {
 	public String bigQueryDdlTable;
 
 	/**
-	 * Logical MySQL instance name stored in the DDL metadata table {@code instance} column.
+	 * When set, written to the DDL metadata table {@code instance} column. When null or empty, the
+	 * destination table is assumed not to define an {@code instance} column.
 	 */
 	public String bigQueryDdlInstance;
+
+	/**
+	 * Row count threshold to flush a BigQuery Storage Write batch for the DDL metadata table.
+	 */
+	public int bigQueryDdlBatchSize;
 
 
 	public int bigQueryThreads;
@@ -941,8 +947,10 @@ public class MaxwellConfig extends AbstractConfig {
 				.withRequiredArg();
 		parser.accepts( "bigquery_ddl_table", "BigQuery table id for DDL metadata (separate from bigquery_table)" )
 				.withRequiredArg();
-		parser.accepts( "bigquery_ddl_instance", "value for the instance column in the DDL metadata table" )
-				.withRequiredArg();
+		parser.accepts( "bigquery_ddl_instance", "value for the instance column when the DDL metadata table defines that column; omit if the table has no instance column" )
+				.withOptionalArg();
+		parser.accepts( "bigquery_ddl_batch_size", "max rows per BigQuery append batch for the DDL metadata table. default: 100" )
+				.withRequiredArg().ofType(Integer.class);
 
 		parser.section( "pubsub" );
 		parser.accepts( "pubsub_project_id", "provide a google cloud platform project id associated with the pubsub topic" )
@@ -1119,6 +1127,7 @@ public class MaxwellConfig extends AbstractConfig {
 		this.bigQueryDdlDataset		= fetchStringOption("bigquery_ddl_dataset", options, properties, null);
 		this.bigQueryDdlTable		= fetchStringOption("bigquery_ddl_table", options, properties, null);
 		this.bigQueryDdlInstance	= fetchStringOption("bigquery_ddl_instance", options, properties, null);
+		this.bigQueryDdlBatchSize	= fetchIntegerOption("bigquery_ddl_batch_size", options, properties, 100);
 
 		this.pubsubProjectId					= fetchStringOption("pubsub_project_id", options, properties, null);
 		this.pubsubTopic						= fetchStringOption("pubsub_topic", options, properties, "maxwell");

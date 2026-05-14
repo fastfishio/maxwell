@@ -566,7 +566,8 @@ public class MaxwellContext {
 					this.config.bigQueryDdlProjectId,
 					this.config.bigQueryDdlDataset,
 					this.config.bigQueryDdlTable,
-					this.config.bigQueryDdlInstance);
+					this.config.bigQueryDdlInstance,
+					this.config.bigQueryDdlBatchSize);
 				break;
 			case "none":
 				this.producer = new NoneProducer(this);

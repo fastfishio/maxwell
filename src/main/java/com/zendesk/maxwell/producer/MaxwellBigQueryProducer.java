@@ -155,22 +155,22 @@ public class MaxwellBigQueryProducer extends AbstractProducer {
   public MaxwellBigQueryProducer(MaxwellContext context, String bigQueryProjectId,
       String bigQueryDataset, String bigQueryTable, int bigqueryThreads,
       String bigQueryDdlProjectId, String bigQueryDdlDataset, String bigQueryDdlTable,
-      String bigQueryDdlInstance)
+      String bigQueryDdlInstance, int bigQueryDdlBatchSize)
       throws IOException {
     super(context);
     bigqueryThreads = Math.max(1, bigqueryThreads);
     this.queue = new ArrayBlockingQueue<>(bigqueryThreads * MaxwellBigQueryProducerWorker.BATCH_SIZE);
 
-    boolean ddlPartial = (bigQueryDdlDataset != null && !bigQueryDdlDataset.isEmpty())
-        || (bigQueryDdlTable != null && !bigQueryDdlTable.isEmpty())
-        || (bigQueryDdlInstance != null && !bigQueryDdlInstance.isEmpty());
-    boolean ddlComplete = (bigQueryDdlDataset != null && !bigQueryDdlDataset.isEmpty())
-        && (bigQueryDdlTable != null && !bigQueryDdlTable.isEmpty())
-        && (bigQueryDdlInstance != null && !bigQueryDdlInstance.isEmpty());
-    if ( ddlPartial && !ddlComplete ) {
+    boolean hasDdlDataset = bigQueryDdlDataset != null && !bigQueryDdlDataset.isEmpty();
+    boolean hasDdlTable = bigQueryDdlTable != null && !bigQueryDdlTable.isEmpty();
+    boolean hasDdlInstance = bigQueryDdlInstance != null && !bigQueryDdlInstance.isEmpty();
+    boolean ddlSinkEnabled = hasDdlDataset && hasDdlTable;
+    if ( (hasDdlDataset != hasDdlTable) || (hasDdlInstance && !ddlSinkEnabled) ) {
       throw new IOException(
-          "bigquery_ddl_dataset, bigquery_ddl_table, and bigquery_ddl_instance must all be set to enable the BigQuery DDL metadata sink");
+          "bigquery_ddl_dataset and bigquery_ddl_table must both be set to enable the BigQuery DDL metadata sink; "
+              + "bigquery_ddl_instance is optional (omit when the DDL table has no instance column)");
     }
+    int ddlBatchSize = Math.max(1, bigQueryDdlBatchSize);
 
     ThreadFactory workerThreadFactory = new ThreadFactoryBuilder().setNameFormat("bq-worker-%d").setDaemon(true).build();
     this.workerExecutor = Executors.newFixedThreadPool(bigqueryThreads, workerThreadFactory);
@@ -182,19 +182,21 @@ public class MaxwellBigQueryProducer extends AbstractProducer {
     TableName tableName = TableName.of(bigQueryProjectId, bigQueryDataset, bigQueryTable);
     TableName ddlTableName = null;
     TableSchema ddlTableSchema = null;
-    if ( ddlComplete ) {
+    if ( ddlSinkEnabled ) {
       String ddlProject = (bigQueryDdlProjectId != null && !bigQueryDdlProjectId.isEmpty())
           ? bigQueryDdlProjectId
           : bigQueryProjectId;
       ddlTableName = TableName.of(ddlProject, bigQueryDdlDataset, bigQueryDdlTable);
       ddlTableSchema = getDdlMetadataTableSchema(ddlTableName);
-      LOGGER.info("[bq-producer] DDL metadata sink enabled: {}", ddlTableName);
+      LOGGER.info("[bq-producer] DDL metadata sink enabled: {} (ddl_batch_size={})", ddlTableName, ddlBatchSize);
     }
-    startWorkers(context, tableName, ddlTableName, ddlTableSchema, ddlComplete, bigQueryDdlInstance, bigqueryThreads);
+    startWorkers(context, tableName, ddlTableName, ddlTableSchema, ddlSinkEnabled, bigQueryDdlInstance,
+        ddlBatchSize, bigqueryThreads);
   }
 
   private void startWorkers(MaxwellContext context, TableName tableName, TableName ddlTableName,
-      TableSchema ddlTableSchema, boolean ddlSinkEnabled, String ddlInstance, int bigqueryThreads) throws IOException {
+      TableSchema ddlTableSchema, boolean ddlSinkEnabled, String ddlInstance, int ddlBatchSize,
+      int bigqueryThreads) throws IOException {
     TableSchema tableSchema = getTableSchema(tableName);
     for (int i = 0; i < bigqueryThreads; i++) {
       try {
@@ -204,7 +206,8 @@ public class MaxwellBigQueryProducer extends AbstractProducer {
             this.callbackExecutor,
             i,
             ddlSinkEnabled,
-            ddlInstance);
+            ddlInstance,
+            ddlBatchSize);
         worker.initialize(tableName, tableSchema, ddlTableName, ddlTableSchema);
         this.workers.add(worker);
         this.workerExecutor.submit(worker);
@@ -370,19 +373,22 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
   private AppendContext ddlAppendContext;
   private final boolean ddlSinkEnabled;
   private final String ddlInstance;
+  private final int ddlBatchSize;
 
   public MaxwellBigQueryProducerWorker(MaxwellContext context,
       ArrayBlockingQueue<RowMap> queue,
       ExecutorService callbackExecutor,
       int workerId,
       boolean ddlSinkEnabled,
-      String ddlInstance) throws IOException {
+      String ddlInstance,
+      int ddlBatchSize) throws IOException {
     super(context);
     this.queue = queue;
     this.callbackExecutor = callbackExecutor;
     this.workerId = workerId;
     this.ddlSinkEnabled = ddlSinkEnabled;
     this.ddlInstance = ddlInstance;
+    this.ddlBatchSize = ddlBatchSize;
     this.scheduledExecutor = Executors.newSingleThreadScheduledExecutor(new ThreadFactoryBuilder().setNameFormat("bq-batch-scheduler-" + workerId).setDaemon(true).build());
     this.taskState = new StoppableTaskState("MaxwellBigQueryProducerWorker-" + workerId); // Keep taskState init
   }
@@ -520,7 +526,9 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
     Object typeObj = ddl.getChangeMap().get("type");
     String changeType = typeObj != null ? typeObj.toString() : "unknown";
     JSONObject record = new JSONObject();
-    record.put("instance", ddlInstance);
+    if ( ddlInstance != null && !ddlInstance.isEmpty() ) {
+      record.put("instance", ddlInstance);
+    }
     record.put("type", changeType);
     record.put("statement", ddl.getSql() != null ? ddl.getSql() : JSONObject.NULL);
 
@@ -544,7 +552,7 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
 
     this.ddlAppendContext.addRow(ddl, record, cc);
 
-    if (this.ddlAppendContext.callbacks.size() >= BATCH_SIZE
+    if (this.ddlAppendContext.callbacks.size() >= this.ddlBatchSize
         || this.ddlAppendContext.getApproximateSize() >= MAX_MESSAGE_SIZE_BYTES) {
       synchronized (this.getLock()) {
         this.attemptBatch(this.ddlAppendContext);
