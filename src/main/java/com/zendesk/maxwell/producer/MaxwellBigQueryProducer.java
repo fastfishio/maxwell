@@ -382,7 +382,7 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
       boolean ddlSinkEnabled,
       String ddlInstance,
       int ddlBatchSize) throws IOException {
-    super(context);
+    super(context, "bigquery-worker-" + workerId);
     this.queue = queue;
     this.callbackExecutor = callbackExecutor;
     this.workerId = workerId;

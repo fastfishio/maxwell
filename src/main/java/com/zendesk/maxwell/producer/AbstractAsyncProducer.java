@@ -51,12 +51,22 @@ public abstract class AbstractAsyncProducer extends AbstractProducer {
 	private InflightMessageList inflightMessages;
 
 	public AbstractAsyncProducer(MaxwellContext context) {
+		this(context, null);
+	}
+
+	/**
+	 * @param inflightMetricSuffix when non-null, appended to the inflight gauge name so multiple
+	 *        async producers (e.g. BigQuery worker threads) do not collide on metric registration.
+	 */
+	public AbstractAsyncProducer(MaxwellContext context, String inflightMetricSuffix) {
 		super(context);
 
 		this.inflightMessages = new InflightMessageList(context);
 
 		Metrics metrics = context.getMetrics();
-		String gaugeName = metrics.metricName("inflightmessages", "count");
+		String gaugeName = (inflightMetricSuffix == null || inflightMetricSuffix.isEmpty())
+			? metrics.metricName("inflightmessages", "count")
+			: metrics.metricName("inflightmessages", "count", inflightMetricSuffix);
 		metrics.register(gaugeName, (Gauge<Long>) () -> (long) inflightMessages.size());
 	}
 
