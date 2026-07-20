@@ -86,6 +86,11 @@ class BigQueryCallback implements ApiFutureCallback<AppendRowsResponse> {
     this.context = context;
   }
 
+  private static boolean isMessageTooLarge(Throwable t) {
+    String message = t.getMessage();
+    return message != null && message.contains("MessageSize is too large");
+  }
+
   @Override
   public void onSuccess(AppendRowsResponse response) {
     for (int i = 0; i < appendContext.callbacks.size(); i++) {
@@ -106,13 +111,36 @@ class BigQueryCallback implements ApiFutureCallback<AppendRowsResponse> {
 
   @Override
   public void onFailure(Throwable t) {
+    LOGGER.error("Worker {} " + t.getClass().getSimpleName() + " @ " + position, parent.getWorkerId());
+    LOGGER.error("Worker {} " + t.getLocalizedMessage(), parent.getWorkerId());
+
+    // BigQuery Storage Write API hard-limits AppendRows to 10MB. JSON size is only an
+    // estimate of the protobuf payload, so oversized batches can still slip through —
+    // split and retry rather than terminating Maxwell.
+    if (isMessageTooLarge(t)) {
+      if (appendContext.data.length() > 1) {
+        LOGGER.warn("Worker {} AppendRows payload too large ({} records); splitting batch and retrying",
+            parent.getWorkerId(), appendContext.data.length());
+        try {
+          this.parent.retrySplitBatch(appendContext);
+          return;
+        } catch (Exception e) {
+          LOGGER.error("Worker {} Failed to split oversized batch: {}", parent.getWorkerId(), e.toString());
+        }
+      } else {
+        LOGGER.error("Worker {} skipping single record that exceeds BigQuery AppendRows size limit @ {}",
+            parent.getWorkerId(), position);
+        this.failedMessageCount.inc();
+        this.failedMessageMeter.mark();
+        appendContext.callbacks.get(0).markCompleted();
+        return;
+      }
+    }
+
     for (int i = 0; i < appendContext.callbacks.size(); i++) {
         this.failedMessageCount.inc();
         this.failedMessageMeter.mark();
     }
-
-    LOGGER.error("Worker {} " + t.getClass().getSimpleName() + " @ " + position, parent.getWorkerId());
-    LOGGER.error("Worker {} " + t.getLocalizedMessage(), parent.getWorkerId());
 
     Status status = Status.fromThrowable(t);
     if (appendContext.retryCount < MAX_RETRY_COUNT
@@ -213,8 +241,11 @@ public class MaxwellBigQueryProducer extends AbstractProducer {
 class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Runnable, StoppableTask {
   static final Logger LOGGER = LoggerFactory.getLogger(MaxwellBigQueryProducerWorker.class);
   public static final int BATCH_SIZE = 100;
-  // checked approximately, leave a buffer
-  public static final long MAX_MESSAGE_SIZE_BYTES = 5_000_000;
+  // BigQuery Storage Write AppendRows hard limit is 10MB. JsonStreamWriter encodes to
+  // protobuf, so JSON string length undercounts wire size — keep a conservative budget.
+  public static final long MAX_MESSAGE_SIZE_BYTES = 4_000_000;
+  // Individual rows above this are skipped; they cannot be split across appends.
+  public static final long MAX_SINGLE_RECORD_BYTES = 8_000_000;
 
   private static final class ColumnTransformation {
     final String jsonPath;
@@ -424,7 +455,7 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
     covertJSONObjectFieldsToString(record);
 
     int recordSize = AppendContext.getJsonByteSize(record);
-    if (recordSize >= 9 * 1024 * 1024) {
+    if (recordSize >= MAX_SINGLE_RECORD_BYTES) {
         LOGGER.error("Worker {} skipping oversized record: {} bytes for table {}.{}, position {}",
             this.workerId, recordSize, r.getDatabase(), r.getTable(), r.getNextPosition());
         cc.markCompleted();
@@ -436,20 +467,26 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
         throw this.error;
       }
 
-      if(this.appendContext == null) {
+      if (this.appendContext == null) {
         this.appendContext = new AppendContext();
         this.scheduleAttempt(this.appendContext);
       }
-    }
 
-    this.appendContext.addRow(r, record, cc);
+      // Flush before adding when this row would push the batch over the size budget.
+      if (!this.appendContext.callbacks.isEmpty()
+          && this.appendContext.getApproximateSize() + recordSize >= MAX_MESSAGE_SIZE_BYTES) {
+        this.attemptBatch(this.appendContext);
+        this.appendContext = new AppendContext();
+        this.scheduleAttempt(this.appendContext);
+      }
 
-    if(this.appendContext.callbacks.size() >= BATCH_SIZE
-       || this.appendContext.getApproximateSize() >= MAX_MESSAGE_SIZE_BYTES) {
-        synchronized (this.getLock()) {
-            this.attemptBatch(this.appendContext);
-            this.appendContext = null;
-        }
+      this.appendContext.addRow(r, record, cc);
+
+      if (this.appendContext.callbacks.size() >= BATCH_SIZE
+          || this.appendContext.getApproximateSize() >= MAX_MESSAGE_SIZE_BYTES) {
+        this.attemptBatch(this.appendContext);
+        this.appendContext = null;
+      }
     }
   }
 
@@ -465,6 +502,16 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
             this.context),
         this.callbackExecutor
     );
+  }
+
+  /**
+   * Split an AppendRows batch that exceeded BigQuery's 10MB limit and retry each half.
+   */
+  public void retrySplitBatch(AppendContext appendContext)
+      throws DescriptorValidationException, IOException {
+    AppendContext[] halves = appendContext.split();
+    attemptBatch(halves[0]);
+    attemptBatch(halves[1]);
   }
 
 
@@ -630,9 +677,35 @@ class AppendContext {
     }
   }
 
+  /**
+   * Split this batch into two halves for retry after a MessageSize rejection.
+   */
+  public AppendContext[] split() {
+    int total = data.length();
+    if (total < 2) {
+      throw new IllegalStateException("Cannot split AppendContext with fewer than 2 records");
+    }
+    int mid = total / 2;
+    AppendContext left = new AppendContext();
+    AppendContext right = new AppendContext();
+    left.retryCount = this.retryCount;
+    right.retryCount = this.retryCount;
+    for (int i = 0; i < total; i++) {
+      AppendContext target = i < mid ? left : right;
+      JSONObject record = data.getJSONObject(i);
+      target.data.put(record);
+      target.approximateSize += getJsonByteSize(record);
+      target.callbacks.add(callbacks.get(i));
+      if (target.position == null) {
+        target.position = this.position;
+      }
+    }
+    return new AppendContext[] { left, right };
+  }
+
   public static int getJsonByteSize(Object json) {
     // Estimate byte size. UTF-8 encoding is assumed, which is standard for JSON.
-    // This is an approximation; actual gRPC message size might differ slightly.
+    // This is an approximation; actual gRPC/protobuf message size is typically larger.
     return json.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
   }
 
