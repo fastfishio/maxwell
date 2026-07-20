@@ -3,7 +3,7 @@ package com.zendesk.maxwell.producer;
 import com.google.api.core.ApiFuture;
 import com.google.api.core.ApiFutureCallback;
 import com.google.api.core.ApiFutures;
-import com.google.api.services.bigquery.model.JsonObject;
+// Keep other Google Cloud imports: BigQuery, BigQueryOptions, Schema, Table, storage.v1.*
 import com.google.cloud.bigquery.BigQuery;
 import com.google.cloud.bigquery.BigQueryOptions;
 import com.google.cloud.bigquery.Schema;
@@ -14,8 +14,9 @@ import com.google.cloud.bigquery.storage.v1.Exceptions.StorageException;
 import com.google.cloud.bigquery.storage.v1.JsonStreamWriter;
 import com.google.cloud.bigquery.storage.v1.TableName;
 import com.google.cloud.bigquery.storage.v1.TableSchema;
+
 import com.google.common.collect.ImmutableList;
-import com.google.common.util.concurrent.MoreExecutors;
+import com.google.common.util.concurrent.ThreadFactoryBuilder; // For naming threads
 import com.google.protobuf.Descriptors.DescriptorValidationException;
 import com.zendesk.maxwell.MaxwellContext;
 import com.zendesk.maxwell.monitoring.Metrics;
@@ -28,9 +29,22 @@ import com.zendesk.maxwell.util.StoppableTaskState;
 import io.grpc.Status;
 import io.grpc.Status.Code;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Phaser;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.stream.Collectors;
+
 import com.codahale.metrics.Counter;
 import com.codahale.metrics.Meter;
 
@@ -44,7 +58,6 @@ class BigQueryCallback implements ApiFutureCallback<AppendRowsResponse> {
   public final Logger LOGGER = LoggerFactory.getLogger(BigQueryCallback.class);
 
   private final MaxwellBigQueryProducerWorker parent;
-  private final AbstractAsyncProducer.CallbackCompleter cc;
   private final Position position;
   private MaxwellContext context;
   AppendContext appendContext;
@@ -60,15 +73,12 @@ class BigQueryCallback implements ApiFutureCallback<AppendRowsResponse> {
 
   public BigQueryCallback(MaxwellBigQueryProducerWorker parent,
       AppendContext appendContext,
-      AbstractAsyncProducer.CallbackCompleter cc,
-      Position position,
       Counter producedMessageCount, Counter failedMessageCount,
       Meter succeededMessageMeter, Meter failedMessageMeter,
       MaxwellContext context) {
     this.parent = parent;
     this.appendContext = appendContext;
-    this.cc = cc;
-    this.position = position;
+    this.position = appendContext.position;
     this.succeededMessageCount = producedMessageCount;
     this.failedMessageCount = failedMessageCount;
     this.succeededMessageMeter = succeededMessageMeter;
@@ -76,40 +86,71 @@ class BigQueryCallback implements ApiFutureCallback<AppendRowsResponse> {
     this.context = context;
   }
 
+  private static boolean isMessageTooLarge(Throwable t) {
+    String message = t.getMessage();
+    return message != null && message.contains("MessageSize is too large");
+  }
+
   @Override
   public void onSuccess(AppendRowsResponse response) {
-    this.succeededMessageCount.inc();
-    this.succeededMessageMeter.mark();
+    for (int i = 0; i < appendContext.callbacks.size(); i++) {
+        this.succeededMessageCount.inc();
+        this.succeededMessageMeter.mark();
+        AbstractAsyncProducer.CallbackCompleter cc = (AbstractAsyncProducer.CallbackCompleter) appendContext.callbacks.get(i);
+        cc.markCompleted();
 
-    if (LOGGER.isDebugEnabled()) {
-      try {
-        LOGGER.debug("-> {}\n" +
-            " {}\n",
-            this.appendContext.r.toJSON(), this.position);
-      } catch (Exception e) {
-        e.printStackTrace();
-      }
+        if (LOGGER.isDebugEnabled()) {
+          try {
+            LOGGER.debug("Worker {} -> {}\n", parent.getWorkerId(), this.position);
+          } catch (Exception e) {
+            e.printStackTrace();
+          }
+        }
     }
-    cc.markCompleted();
   }
 
   @Override
   public void onFailure(Throwable t) {
-    this.failedMessageCount.inc();
-    this.failedMessageMeter.mark();
+    LOGGER.error("Worker {} " + t.getClass().getSimpleName() + " @ " + position, parent.getWorkerId());
+    LOGGER.error("Worker {} " + t.getLocalizedMessage(), parent.getWorkerId());
 
-    LOGGER.error(t.getClass().getSimpleName() + " @ " + position);
-    LOGGER.error(t.getLocalizedMessage());
+    // BigQuery Storage Write API hard-limits AppendRows to 10MB. JSON size is only an
+    // estimate of the protobuf payload, so oversized batches can still slip through —
+    // split and retry rather than terminating Maxwell.
+    if (isMessageTooLarge(t)) {
+      if (appendContext.data.length() > 1) {
+        LOGGER.warn("Worker {} AppendRows payload too large ({} records); splitting batch and retrying",
+            parent.getWorkerId(), appendContext.data.length());
+        try {
+          this.parent.retrySplitBatch(appendContext);
+          return;
+        } catch (Exception e) {
+          LOGGER.error("Worker {} Failed to split oversized batch: {}", parent.getWorkerId(), e.toString());
+        }
+      } else {
+        LOGGER.error("Worker {} skipping single record that exceeds BigQuery AppendRows size limit @ {}",
+            parent.getWorkerId(), position);
+        this.failedMessageCount.inc();
+        this.failedMessageMeter.mark();
+        appendContext.callbacks.get(0).markCompleted();
+        return;
+      }
+    }
+
+    for (int i = 0; i < appendContext.callbacks.size(); i++) {
+        this.failedMessageCount.inc();
+        this.failedMessageMeter.mark();
+    }
 
     Status status = Status.fromThrowable(t);
     if (appendContext.retryCount < MAX_RETRY_COUNT
         && RETRIABLE_ERROR_CODES.contains(status.getCode())) {
       appendContext.retryCount++;
       try {
-        this.parent.sendAsync(appendContext.r, this.cc);
+        this.parent.attemptBatch(appendContext);
         return;
       } catch (Exception e) {
-        System.out.format("Failed to retry append: %s\n", e);
+        System.out.format("Worker {} Failed to retry append: %s\n", parent.getWorkerId(), e);
       }
     }
 
@@ -121,35 +162,75 @@ class BigQueryCallback implements ApiFutureCallback<AppendRowsResponse> {
         return;
       }
     }
-    cc.markCompleted();
+    // got an error, but we are ingoring producer error
+    for (int i = 0; i < appendContext.callbacks.size(); i++) {
+        AbstractAsyncProducer.CallbackCompleter cc = (AbstractAsyncProducer.CallbackCompleter) appendContext.callbacks.get(i);
+        cc.markCompleted();
+    }
   }
 }
 
 public class MaxwellBigQueryProducer extends AbstractProducer {
+  private static final Logger LOGGER = LoggerFactory.getLogger(MaxwellBigQueryProducer.class);
 
   private final ArrayBlockingQueue<RowMap> queue;
-  private final MaxwellBigQueryProducerWorker worker;
+  private final List<MaxwellBigQueryProducerWorker> workers;
+  private final ExecutorService workerExecutor;
+  private final ExecutorService callbackExecutor;
 
   public MaxwellBigQueryProducer(MaxwellContext context, String bigQueryProjectId,
-      String bigQueryDataset, String bigQueryTable)
+      String bigQueryDataset, String bigQueryTable, int bigqueryThreads)
       throws IOException {
     super(context);
-    this.queue = new ArrayBlockingQueue<>(100);
-    this.worker = new MaxwellBigQueryProducerWorker(context, this.queue, bigQueryProjectId, bigQueryDataset,
-        bigQueryTable);
+    bigqueryThreads = Math.max(1, bigqueryThreads);
+    this.queue = new ArrayBlockingQueue<>(bigqueryThreads * MaxwellBigQueryProducerWorker.BATCH_SIZE);
 
-    TableName table = TableName.of(bigQueryProjectId, bigQueryDataset, bigQueryTable);
-    try {
-      this.worker.initialize(table);
-    } catch (DescriptorValidationException e) {
-      e.printStackTrace();
-    } catch (InterruptedException e) {
-      e.printStackTrace();
+    ThreadFactory workerThreadFactory = new ThreadFactoryBuilder().setNameFormat("bq-worker-%d").setDaemon(true).build();
+    this.workerExecutor = Executors.newFixedThreadPool(bigqueryThreads, workerThreadFactory);
+
+    ThreadFactory callbackThreadFactory = new ThreadFactoryBuilder().setNameFormat("bq-callback-%d").setDaemon(true).build();
+    this.callbackExecutor = Executors.newCachedThreadPool(callbackThreadFactory);
+
+    this.workers = new ArrayList<>(bigqueryThreads);
+    TableName tableName = TableName.of(bigQueryProjectId, bigQueryDataset, bigQueryTable);
+    startWorkers(context, tableName);
+  }
+
+  private void startWorkers(MaxwellContext context, TableName tableName) throws IOException {
+    int numWorkers = this.workers.size();
+    TableSchema tableSchema = getTableSchema(tableName);
+     // Create and start workers
+    for (int i = 0; i < Math.max(1, numWorkers); i++) {
+       try {
+            MaxwellBigQueryProducerWorker worker = new MaxwellBigQueryProducerWorker(
+                context,
+                this.queue,
+                this.callbackExecutor, // Pass callback executor
+                i // Pass worker ID
+            );
+            worker.initialize(tableName, tableSchema);
+            this.workers.add(worker);
+            this.workerExecutor.submit(worker);
+       } catch (DescriptorValidationException | IOException | InterruptedException e) {
+           LOGGER.error("Failed to initialize MaxwellBigQueryProducer worker {}: {}", i, e.getMessage(), e);
+           // Don't try to shutdown executors, just throw
+           throw new IOException("Failed to initialize worker " + i, e);
+       }
     }
+    LOGGER.info("Submitted {} workers to executor.", this.workers.size());
+  }
 
-    Thread thread = new Thread(this.worker, "maxwell-bigquery-worker");
-    thread.setDaemon(true);
-    thread.start();
+  private TableSchema getTableSchema(TableName tName) throws IOException {
+    BigQuery bigquery = BigQueryOptions.newBuilder().setProjectId(tName.getProject()).build().getService();
+    Table table = bigquery.getTable(tName.getDataset(), tName.getTable());
+    Schema schema = table.getDefinition().getSchema();
+    // Filter out bq_inserted_at column from the schema
+    List<com.google.cloud.bigquery.Field> filteredFields = schema.getFields().stream()
+      .filter(field -> !"bq_inserted_at".equals(field.getName()))
+      .collect(Collectors.toList());
+    Schema filteredSchema = Schema.of(filteredFields);
+    TableSchema tableSchema = BqToBqStorageSchemaConverter.convertTableSchema(filteredSchema);
+    return tableSchema;
   }
 
   @Override
@@ -157,21 +238,120 @@ public class MaxwellBigQueryProducer extends AbstractProducer {
     this.queue.put(r);
   }
 }
-
-class AppendContext {
-  JSONArray data;
-  int retryCount = 0;
-  RowMap r = null;
-
-  AppendContext(JSONArray data, int retryCount, RowMap r) {
-    this.data = data;
-    this.retryCount = retryCount;
-    this.r = r;
-  }
-}
-
 class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Runnable, StoppableTask {
   static final Logger LOGGER = LoggerFactory.getLogger(MaxwellBigQueryProducerWorker.class);
+  public static final int BATCH_SIZE = 100;
+  // BigQuery Storage Write AppendRows hard limit is 10MB. JsonStreamWriter encodes to
+  // protobuf, so JSON string length undercounts wire size — keep a conservative budget.
+  public static final long MAX_MESSAGE_SIZE_BYTES = 4_000_000;
+  // Individual rows above this are skipped; they cannot be split across appends.
+  public static final long MAX_SINGLE_RECORD_BYTES = 8_000_000;
+
+  private static final class ColumnTransformation {
+    final String jsonPath;
+    final String transform;
+
+    ColumnTransformation(String jsonPath, String transform) {
+      this.jsonPath = jsonPath;
+      this.transform = transform;
+    }
+  }
+
+  private static final Map<String, Map<String, Map<String, List<ColumnTransformation>>>> COLUMN_TRANSFORMATIONS;
+
+  static {
+    String envValue = System.getenv("column_transformations");
+    COLUMN_TRANSFORMATIONS = parseColumnTransformations(envValue);
+    if (!COLUMN_TRANSFORMATIONS.isEmpty()) {
+      LOGGER.info("Loaded column transformations: {}", envValue);
+    }
+  }
+
+  private static Map<String, Map<String, Map<String, List<ColumnTransformation>>>> parseColumnTransformations(String envValue) {
+    if (envValue == null || envValue.isEmpty()) {
+      return Collections.emptyMap();
+    }
+
+    String cleaned = envValue.replaceAll("\\s+", "");
+    String[] entries = cleaned.split(",");
+    Map<String, Map<String, Map<String, List<ColumnTransformation>>>> transformations = new HashMap<>();
+    java.util.Set<String> seen = new java.util.HashSet<>();
+
+    for (String entry : entries) {
+      if (entry.isEmpty()) {
+        continue;
+      }
+
+      int ampIdx = entry.indexOf('&');
+      if (ampIdx < 1 || ampIdx == entry.length() - 1) {
+        throw new IllegalArgumentException(
+          "Invalid column_transformations entry (missing '&' or empty transform/target): '" + entry + "'");
+      }
+
+      String transform = entry.substring(0, ampIdx);
+      String target = entry.substring(ampIdx + 1);
+
+      String[] dbTableCol = target.split("\\.", 3);
+      if (dbTableCol.length != 3) {
+        throw new IllegalArgumentException(
+          "Invalid column_transformations target (expected database.table.column[:jsonpath]): '" + target + "'");
+      }
+
+      String database = dbTableCol[0];
+      String table = dbTableCol[1];
+      String columnPart = dbTableCol[2];
+
+      if (!database.matches("[a-zA-Z0-9_]+") || !table.matches("[a-zA-Z0-9_]+")) {
+        throw new IllegalArgumentException(
+          "Invalid database or table name (alphanumeric and underscores only): '" + target + "'");
+      }
+
+      String columnName;
+      String jsonPath = null;
+      int colonIdx = columnPart.indexOf(':');
+      if (colonIdx >= 0) {
+        columnName = columnPart.substring(0, colonIdx);
+        jsonPath = columnPart.substring(colonIdx + 1);
+        if (jsonPath.isEmpty() || !jsonPath.startsWith("$")) {
+          throw new IllegalArgumentException(
+            "Invalid json path (must start with '$'): '" + jsonPath + "' in entry '" + entry + "'");
+        }
+      } else {
+        columnName = columnPart;
+      }
+
+      if (!columnName.matches("[a-zA-Z0-9_]+")) {
+        throw new IllegalArgumentException(
+          "Invalid column name (alphanumeric and underscores only): '" + columnName + "' in entry '" + entry + "'");
+      }
+
+      String fullKey = database + "." + table + "." + columnName + (jsonPath != null ? ":" + jsonPath : "");
+      if (!seen.add(fullKey)) {
+        throw new IllegalArgumentException(
+          "Duplicate column_transformations entry for: '" + fullKey + "'");
+      }
+
+      List<ColumnTransformation> columnTransformations = transformations
+        .computeIfAbsent(database, db -> new HashMap<>())
+        .computeIfAbsent(table, t -> new HashMap<>())
+        .computeIfAbsent(columnName, c -> new ArrayList<>());
+
+      if (jsonPath == null && !columnTransformations.isEmpty()) {
+        throw new IllegalArgumentException(
+          "Cannot mix whole-column and json-path transformations for: '" + database + "." + table + "." + columnName + "'");
+      }
+      if (!columnTransformations.isEmpty() && columnTransformations.get(0).jsonPath == null) {
+        throw new IllegalArgumentException(
+          "Cannot mix whole-column and json-path transformations for: '" + database + "." + table + "." + columnName + "'");
+      }
+
+      columnTransformations.add(new ColumnTransformation(jsonPath, transform));
+    }
+
+    return Collections.unmodifiableMap(transformations);
+  }
+
+
 
   private final ArrayBlockingQueue<RowMap> queue;
   private StoppableTaskState taskState;
@@ -181,18 +361,30 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
   @GuardedBy("lock")
   private RuntimeException error = null;
   private JsonStreamWriter streamWriter;
+  private final ScheduledExecutorService scheduledExecutor;
+  private final ExecutorService callbackExecutor;
+  private final int workerId;
+  private AppendContext appendContext;
 
   public MaxwellBigQueryProducerWorker(MaxwellContext context,
-      ArrayBlockingQueue<RowMap> queue, String bigQueryProjectId,
-      String bigQueryDataset, String bigQueryTable) throws IOException {
+      ArrayBlockingQueue<RowMap> queue,
+      ExecutorService callbackExecutor,
+      int workerId) throws IOException {
     super(context);
     this.queue = queue;
+    this.callbackExecutor = callbackExecutor;
+    this.workerId = workerId;
+    this.scheduledExecutor = Executors.newSingleThreadScheduledExecutor(new ThreadFactoryBuilder().setNameFormat("bq-batch-scheduler-" + workerId).setDaemon(true).build());
     Metrics metrics = context.getMetrics();
-    this.taskState = new StoppableTaskState("MaxwellBigQueryProducerWorker");
+    this.taskState = new StoppableTaskState("MaxwellBigQueryProducerWorker-" + workerId); // Keep taskState init
   }
 
   public Object getLock() {
     return lock;
+  }
+
+  public int getWorkerId() {
+    return workerId;
   }
 
   public RuntimeException getError() {
@@ -213,20 +405,17 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
     record.put("old", old);
   }
 
-  public void initialize(TableName tName)
-      throws DescriptorValidationException, IOException, InterruptedException {
 
-    BigQuery bigquery = BigQueryOptions.newBuilder().setProjectId(tName.getProject()).build().getService();
-    Table table = bigquery.getTable(tName.getDataset(), tName.getTable());
-    Schema schema = table.getDefinition().getSchema();
-    TableSchema tableSchema = BqToBqStorageSchemaConverter.convertTableSchema(schema);
-    streamWriter = JsonStreamWriter.newBuilder(tName.toString(), tableSchema).build();
+  public void initialize(TableName tName, TableSchema tableSchema)
+      throws DescriptorValidationException, IOException, InterruptedException {
+    this.streamWriter = JsonStreamWriter.newBuilder(tName.toString(), tableSchema).build();
   }
 
   @Override
   public void requestStop() throws Exception {
     taskState.requestStop();
     streamWriter.close();
+    scheduledExecutor.shutdown();
     synchronized (this.lock) {
       if (this.error != null) {
         throw this.error;
@@ -260,23 +449,268 @@ class MaxwellBigQueryProducerWorker extends AbstractAsyncProducer implements Run
 
   @Override
   public void sendAsync(RowMap r, CallbackCompleter cc) throws Exception {
+
+    JSONObject record = new JSONObject(r.toJSON(outputConfig));
+    applyColumnTransformations(r, record);
+    covertJSONObjectFieldsToString(record);
+
+    int recordSize = AppendContext.getJsonByteSize(record);
+    if (recordSize >= MAX_SINGLE_RECORD_BYTES) {
+        LOGGER.error("Worker {} skipping oversized record: {} bytes for table {}.{}, position {}",
+            this.workerId, recordSize, r.getDatabase(), r.getTable(), r.getNextPosition());
+        cc.markCompleted();
+        return;
+    }
+
     synchronized (this.lock) {
       if (this.error != null) {
         throw this.error;
       }
-    }
-    JSONArray jsonArr = new JSONArray();
-    JSONObject record = new JSONObject(r.toJSON(outputConfig));
-    //convert json and array fields to String
-    covertJSONObjectFieldsToString(record);
-    jsonArr.put(record);
-    AppendContext appendContext = new AppendContext(jsonArr, 0, r);
 
+      if (this.appendContext == null) {
+        this.appendContext = new AppendContext();
+        this.scheduleAttempt(this.appendContext);
+      }
+
+      // Flush before adding when this row would push the batch over the size budget.
+      if (!this.appendContext.callbacks.isEmpty()
+          && this.appendContext.getApproximateSize() + recordSize >= MAX_MESSAGE_SIZE_BYTES) {
+        this.attemptBatch(this.appendContext);
+        this.appendContext = new AppendContext();
+        this.scheduleAttempt(this.appendContext);
+      }
+
+      this.appendContext.addRow(r, record, cc);
+
+      if (this.appendContext.callbacks.size() >= BATCH_SIZE
+          || this.appendContext.getApproximateSize() >= MAX_MESSAGE_SIZE_BYTES) {
+        this.attemptBatch(this.appendContext);
+        this.appendContext = null;
+      }
+    }
+  }
+
+  public void attemptBatch(AppendContext appendContext) throws DescriptorValidationException, IOException {
+    if(appendContext.scheduledTask != null && !appendContext.scheduledTask.isDone()) {
+      appendContext.scheduledTask.cancel(false);
+    }
     ApiFuture<AppendRowsResponse> future = streamWriter.append(appendContext.data);
+
     ApiFutures.addCallback(
-        future, new BigQueryCallback(this, appendContext, cc, r.getNextPosition(),
+        future, new BigQueryCallback(this, appendContext,
             this.succeededMessageCount, this.failedMessageCount, this.succeededMessageMeter, this.failedMessageMeter,
             this.context),
-        MoreExecutors.directExecutor());
+        this.callbackExecutor
+    );
   }
+
+  /**
+   * Split an AppendRows batch that exceeded BigQuery's 10MB limit and retry each half.
+   */
+  public void retrySplitBatch(AppendContext appendContext)
+      throws DescriptorValidationException, IOException {
+    AppendContext[] halves = appendContext.split();
+    attemptBatch(halves[0]);
+    attemptBatch(halves[1]);
+  }
+
+
+  public void scheduleAttempt(final AppendContext appendContext) {
+    appendContext.scheduledTask = this.scheduledExecutor.schedule(() -> {
+      try {
+        synchronized (this.getLock()) {
+          this.attemptBatch(this.appendContext);
+          this.appendContext = null; // Nullify after attempting via scheduler
+        }
+      } catch (Exception e) {
+        LOGGER.error("Error sending scheduled bigquery batch message");
+        e.printStackTrace();
+      }
+    }, 1, TimeUnit.MINUTES); // 1 minute delay
+  }
+
+  private void applyColumnTransformations(RowMap row, JSONObject record) {
+    if (COLUMN_TRANSFORMATIONS.isEmpty()) {
+      return;
+    }
+
+    Map<String, Map<String, List<ColumnTransformation>>> databaseConfig = COLUMN_TRANSFORMATIONS.get(row.getDatabase());
+    if (databaseConfig == null) {
+      return;
+    }
+
+    Map<String, List<ColumnTransformation>> tableConfig = databaseConfig.get(row.getTable());
+    if (tableConfig == null || tableConfig.isEmpty()) {
+      return;
+    }
+
+    applyTransformations(record.opt("data"), tableConfig);
+    applyTransformations(record.opt("old"), tableConfig);
+  }
+
+  private void applyTransformations(Object obj, Map<String, List<ColumnTransformation>> tableConfig) {
+    if (!(obj instanceof JSONObject)) {
+      return;
+    }
+
+    JSONObject target = (JSONObject) obj;
+    for (Map.Entry<String, List<ColumnTransformation>> entry : tableConfig.entrySet()) {
+      String columnName = entry.getKey();
+      if (!target.has(columnName)) {
+        continue;
+      }
+
+      for (ColumnTransformation t : entry.getValue()) {
+        if (t.jsonPath == null) {
+          target.put(columnName, transformValue(t.transform, target.get(columnName)));
+        } else {
+          Object columnValue = target.get(columnName);
+          if (columnValue instanceof JSONObject) {
+            applyJsonPathTransform((JSONObject) columnValue, t.jsonPath, t.transform);
+          }
+        }
+      }
+    }
+  }
+
+  private void applyJsonPathTransform(JSONObject root, String jsonPath, String transform) {
+    String[] keys = jsonPath.split("\\.");
+    if (keys.length < 2 || !"$".equals(keys[0])) {
+      LOGGER.warn("Invalid json path: {}", jsonPath);
+      return;
+    }
+
+    JSONObject current = root;
+    for (int i = 1; i < keys.length - 1; i++) {
+      Object next = current.opt(keys[i]);
+      if (!(next instanceof JSONObject)) {
+        return;
+      }
+      current = (JSONObject) next;
+    }
+
+    String leafKey = keys[keys.length - 1];
+    if (current.has(leafKey)) {
+      current.put(leafKey, transformValue(transform, current.get(leafKey)));
+    }
+  }
+
+  private Object transformValue(String transformType, Object originalValue) {
+    try {
+      if (transformType == null) {
+        return originalValue;
+      }
+
+      String[] parts = transformType.split(":", 2);
+      String type = parts[0].trim().toLowerCase();
+      String info = parts.length > 1 ? parts[1].trim() : null;
+
+      switch (type) {
+        case "clear":
+          return transformClear(originalValue, info);
+        case "mask":
+          return transformMask(originalValue, info);
+        default:
+          LOGGER.warn("Unknown column transformation type: {}", transformType);
+          return originalValue;
+      }
+    } catch (Exception e) {
+      LOGGER.error("Error transforming value with transform '{}': {}", transformType, e.getMessage());
+      return originalValue;
+    }
+  }
+
+  private Object transformClear(Object originalValue, String info) {
+    return JSONObject.NULL;
+  }
+
+  private Object transformMask(Object originalValue, String info) {
+    if (originalValue == null || originalValue == JSONObject.NULL || info == null || !(originalValue instanceof String)) {
+      return originalValue;
+    }
+
+    String[] params = info.split(":", 2);
+    if (params.length != 2) {
+      LOGGER.warn("mask requires two parameters X and Y, got: {}", info);
+      return originalValue;
+    }
+
+    int keepFirst = Integer.parseInt(params[0].trim());
+    int keepLast = Integer.parseInt(params[1].trim());
+    String value = (String) originalValue;
+
+    if (keepFirst + keepLast >= value.length()) {
+      return originalValue;
+    }
+
+    int maskLength = value.length() - keepFirst - keepLast;
+    return value.substring(0, keepFirst)
+      + "*".repeat(maskLength)
+      + value.substring(value.length() - keepLast);
+  }
+}
+
+
+class AppendContext {
+  JSONArray data;
+  int retryCount = 0;
+  int records = 0;
+  int approximateSize = 0;
+  Position position;
+  public ArrayList<AbstractAsyncProducer.CallbackCompleter> callbacks;
+  public ScheduledFuture<?> scheduledTask;
+
+  AppendContext() {
+    this.data = new JSONArray();
+    this.retryCount = 0;
+    this.records = 0;
+    this.approximateSize = 0;
+    this.callbacks = new ArrayList<AbstractAsyncProducer.CallbackCompleter>();
+  }
+
+  public void addRow(RowMap r, JSONObject record, AbstractAsyncProducer.CallbackCompleter cc) {
+    this.data.put(record);
+    this.approximateSize += getJsonByteSize(record);
+    this.callbacks.add(cc);
+    if(this.position == null) {
+        this.position = r.getNextPosition();
+    }
+  }
+
+  /**
+   * Split this batch into two halves for retry after a MessageSize rejection.
+   */
+  public AppendContext[] split() {
+    int total = data.length();
+    if (total < 2) {
+      throw new IllegalStateException("Cannot split AppendContext with fewer than 2 records");
+    }
+    int mid = total / 2;
+    AppendContext left = new AppendContext();
+    AppendContext right = new AppendContext();
+    left.retryCount = this.retryCount;
+    right.retryCount = this.retryCount;
+    for (int i = 0; i < total; i++) {
+      AppendContext target = i < mid ? left : right;
+      JSONObject record = data.getJSONObject(i);
+      target.data.put(record);
+      target.approximateSize += getJsonByteSize(record);
+      target.callbacks.add(callbacks.get(i));
+      if (target.position == null) {
+        target.position = this.position;
+      }
+    }
+    return new AppendContext[] { left, right };
+  }
+
+  public static int getJsonByteSize(Object json) {
+    // Estimate byte size. UTF-8 encoding is assumed, which is standard for JSON.
+    // This is an approximation; actual gRPC/protobuf message size is typically larger.
+    return json.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+  }
+
+  public int getApproximateSize() {
+    return approximateSize;
+  }
+
 }
