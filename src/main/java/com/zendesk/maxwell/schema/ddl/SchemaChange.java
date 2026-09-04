@@ -40,6 +40,12 @@ public abstract class SchemaChange {
 		SQL_BLACKLIST.add(Pattern.compile("\\A\\s*SET\\s+PASSWORD", Pattern.CASE_INSENSITIVE | Pattern.MULTILINE));
 		SQL_BLACKLIST.add(Pattern.compile("\\A\\s*(ALTER|CREATE|DROP|RENAME)\\s+USER", Pattern.CASE_INSENSITIVE | Pattern.MULTILINE));
 		SQL_BLACKLIST.add(Pattern.compile("\\A\\s*ALTER\\s+INSTANCE.*", Pattern.CASE_INSENSITIVE | Pattern.MULTILINE));
+		// MySQL 8.4 supports changing a database's read-only state.  This does not
+		// change any schema metadata that Maxwell uses to decode row events.
+		SQL_BLACKLIST.add(Pattern.compile(
+			"\\A\\s*ALTER\\s+(?:DATABASE|SCHEMA)(?:\\s+(?!READ\\b)(?:`(?:``|[^`])+`|[^\\s;]+))?\\s+READ\\s+ONLY\\s*=\\s*(?:DEFAULT|[01])\\s*;?\\s*\\z",
+			Pattern.CASE_INSENSITIVE | Pattern.MULTILINE
+		));
 
 		SQL_BLACKLIST.add(Pattern.compile("\\A\\s*(ALTER|CREATE|DROP)\\s+TEMPORARY\\s+TABLE", Pattern.CASE_INSENSITIVE | Pattern.MULTILINE));
 		SQL_BLACKLIST.add(Pattern.compile("\\A\\s*(ALTER|CREATE|DROP)\\s+TABLESPACE", Pattern.CASE_INSENSITIVE | Pattern.MULTILINE));

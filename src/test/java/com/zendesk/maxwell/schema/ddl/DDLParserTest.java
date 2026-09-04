@@ -318,6 +318,10 @@ public class DDLParserTest {
 			"SET STATEMENT max=1, min_var=3,v=9 FOR FLUSH",
 			"SET STATEMENT max='1', min=RRRR,v=9 FOR FLUSH",
 			"SET statement max=\"1\", min='3',v=RRR, long_long_ago=4 FOR FLUSH",
+			"/* ApplicationName=DBeaver 26.2.0 - SQLEditor <Script-143.sql> */ ALTER DATABASE dataplat READ ONLY = 1",
+			"ALTER DATABASE `dataplat` READ ONLY = 0;",
+			"alter schema dataplat read only = default",
+			"ALTER DATABASE READ ONLY = 1",
 		};
 
 		for ( String s : testSQL ) {
