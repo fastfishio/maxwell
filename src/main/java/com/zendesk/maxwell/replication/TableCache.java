@@ -2,6 +2,7 @@ package com.zendesk.maxwell.replication;
 
 import java.util.HashMap;
 
+import com.github.shyiko.mysql.binlog.event.TableMapEventData;
 import com.zendesk.maxwell.filtering.Filter;
 import com.zendesk.maxwell.schema.Database;
 import com.zendesk.maxwell.schema.Schema;
@@ -40,6 +41,20 @@ public class TableCache {
 			}
 		}
 
+	}
+
+	/**
+	 * Cache a table definition carried by a MySQL 8 TABLE_MAP event. Unlike the
+	 * persisted-schema path, replace the entry on every event because TABLE_MAP
+	 * is the authoritative schema generation for the following row events.
+	 */
+	public void processEvent(TableMapEventData event, Filter filter) {
+		if (filter.isTableBlacklisted(event.getDatabase(), event.getTable())) {
+			tableMapCache.remove(event.getTableId());
+			return;
+		}
+
+		tableMapCache.put(event.getTableId(), BinlogTableMetadata.buildTable(event));
 	}
 
 	public Table getTable(Long tableId) {

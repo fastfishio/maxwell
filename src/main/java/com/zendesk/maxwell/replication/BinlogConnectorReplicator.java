@@ -76,6 +76,7 @@ public class BinlogConnectorReplicator extends RunLoopProcess implements Replica
 	private final Meter rowMeter;
 
 	private SchemaStore schemaStore;
+	private final boolean useBinlogRowMetadata;
 	private Histogram transactionRowCount;
 	private Histogram transactionExecutionTime;
 
@@ -124,7 +125,8 @@ public class BinlogConnectorReplicator extends RunLoopProcess implements Replica
 				outputConfig,
 				bufferMemoryUsage,
 				replicationReconnectionRetries,
-				BINLOG_QUEUE_SIZE
+				BINLOG_QUEUE_SIZE,
+				false
 		);
 	}
 
@@ -148,6 +150,50 @@ public class BinlogConnectorReplicator extends RunLoopProcess implements Replica
 		int replicationReconnectionRetries,
 		int binlogEventQueueSize
 	) {
+		this(
+			schemaStore,
+			producer,
+			bootstrapper,
+			mysqlConfig,
+			replicaServerID,
+			maxwellSchemaDatabaseName,
+			metrics,
+			start,
+			stopOnEOF,
+			clientID,
+			heartbeatNotifier,
+			scripting,
+			filter,
+			ignoreMissingSchema,
+			outputConfig,
+			bufferMemoryUsage,
+			replicationReconnectionRetries,
+			binlogEventQueueSize,
+			false
+		);
+	}
+
+	public BinlogConnectorReplicator(
+		SchemaStore schemaStore,
+		AbstractProducer producer,
+		BootstrapController bootstrapper,
+		MaxwellMysqlConfig mysqlConfig,
+		Long replicaServerID,
+		String maxwellSchemaDatabaseName,
+		Metrics metrics,
+		Position start,
+		boolean stopOnEOF,
+		String clientID,
+		HeartbeatNotifier heartbeatNotifier,
+		Scripting scripting,
+		Filter filter,
+		boolean ignoreMissingSchema,
+		MaxwellOutputConfig outputConfig,
+		float bufferMemoryUsage,
+		int replicationReconnectionRetries,
+		int binlogEventQueueSize,
+		boolean useBinlogRowMetadata
+	) {
 		this.clientID = clientID;
 		this.bootstrapper = bootstrapper;
 		this.maxwellSchemaDatabaseName = maxwellSchemaDatabaseName;
@@ -157,6 +203,7 @@ public class BinlogConnectorReplicator extends RunLoopProcess implements Replica
 		this.stopOnEOF = stopOnEOF;
 		this.scripting = scripting;
 		this.schemaStore = schemaStore;
+		this.useBinlogRowMetadata = useBinlogRowMetadata;
 		this.tableCache = new TableCache(maxwellSchemaDatabaseName);
 		this.filter = filter;
 		this.ignoreMissingSchema = ignoreMissingSchema;
@@ -403,6 +450,14 @@ public class BinlogConnectorReplicator extends RunLoopProcess implements Replica
 	}
 
 	private void processQueryEvent(BinlogConnectorEvent event) throws Exception {
+		if (useBinlogRowMetadata) {
+			// TABLE_MAP is authoritative in this mode. DDL is deliberately not
+			// parsed, persisted, or emitted; the next TABLE_MAP supplies the new
+			// definition.
+			tableCache.clear();
+			return;
+		}
+
 		QueryEventData data = event.queryData();
 		processQueryEvent(
 			data.getDatabase(),
@@ -589,7 +644,7 @@ public class BinlogConnectorReplicator extends RunLoopProcess implements Replica
 					break;
 				case TABLE_MAP:
 					TableMapEventData data = event.tableMapData();
-					tableCache.processEvent(getSchema(), this.filter, this.ignoreMissingSchema, data.getTableId(), data.getDatabase(), data.getTable());
+					processTableMapEvent(data);
 					break;
 				case ROWS_QUERY:
 					RowsQueryEventData rqed = event.getEvent().getData();
@@ -717,7 +772,7 @@ public class BinlogConnectorReplicator extends RunLoopProcess implements Replica
 					break;
 				case TABLE_MAP:
 					TableMapEventData data = event.tableMapData();
-					tableCache.processEvent(getSchema(), this.filter,this.ignoreMissingSchema, data.getTableId(), data.getDatabase(), data.getTable());
+					processTableMapEvent(data);
 					break;
 				case QUERY:
 					QueryEventData qe = event.queryData();
@@ -775,11 +830,26 @@ public class BinlogConnectorReplicator extends RunLoopProcess implements Replica
 	}
 
 	public Schema getSchema() throws SchemaStoreException {
+		if (this.schemaStore == null)
+			throw new SchemaStoreException("schema history is disabled by --schema_source=binlog");
 		return this.schemaStore.getSchema();
 	}
 
 	public Long getSchemaId() throws SchemaStoreException {
+		if (this.schemaStore == null)
+			return null;
 		return this.schemaStore.getSchemaID();
+	}
+
+	public boolean usesBinlogRowMetadata() {
+		return useBinlogRowMetadata;
+	}
+
+	private void processTableMapEvent(TableMapEventData data) throws SchemaStoreException {
+		if (useBinlogRowMetadata)
+			tableCache.processEvent(data, this.filter);
+		else
+			tableCache.processEvent(getSchema(), this.filter, this.ignoreMissingSchema, data.getTableId(), data.getDatabase(), data.getTable());
 	}
 
 	@Override

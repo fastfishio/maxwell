@@ -291,6 +291,12 @@ kafka.acks=1
 # turn this option on and use filters to only include what you need.
 #ignore_missing_schema = false
 
+# Resolve row column names and types from MySQL 8 FULL TABLE_MAP metadata instead
+# of Maxwell's persisted DDL history. Requires binlog_row_metadata=FULL on MySQL
+# before the configured/stored starting position. DDL and schema_id output are
+# unavailable in this mode.
+#schema_source = mysql
+
 # javascript filter
 # maxwell can run a bit of javascript for each row if you need very custom filtering/data munging.
 # See http://maxwells-daemon.io/filtering/#javascript_filters for more details
