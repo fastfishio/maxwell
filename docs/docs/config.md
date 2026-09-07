@@ -28,6 +28,7 @@ replica_server_id              | LONG                 | unique numeric identifie
 master_recovery                | BOOLEAN              | enable experimental master recovery code            | false
 gtid_mode                      | BOOLEAN              | enable GTID-based replication                       | false
 recapture_schema               | BOOLEAN              | recapture the latest schema. Not available in config.properties. | false
+schema_source                  | mysql \| binlog       | resolve row schemas from Maxwell's DDL history or MySQL 8 FULL TABLE_MAP metadata | mysql
 max_schemas                    | LONG                 | how many schema deltas to keep before triggering compaction operation | unlimited
 binlog_heartbeat               | BOOLEAN              | enable binlog heartbeats to detect stale connections | DISABLED
 &nbsp;
@@ -45,6 +46,19 @@ schema_user                    | STRING               | user on schema-capture s
 schema_ssl                     | [SSL_OPT](#sslopt)   | SSL behavior for schema-capture server              | DISABLED
 schema_jdbc_options            | STRING               | mysql jdbc connection options for schema server     | [DEFAULT_JDBC_OPTS](#jdbcopts)
 &nbsp;
+
+### Binlog table-metadata schema source
+
+On MySQL 8, `schema_source=binlog` makes the `TABLE_MAP` event immediately before each row event authoritative for column names, types, signedness, character sets, enum/set values, geometry types, and primary keys. Maxwell does not capture an initial schema or parse and persist DDL in this mode. This avoids schema-history drift during online schema changes such as gh-ost cutovers.
+
+The MySQL server must have `binlog_row_metadata=FULL`; Maxwell checks this at startup. The setting affects newly written binlog events only, so the starting position must not be older than the point where `FULL` was enabled. `output_ddl`, `output_schema_id`, and `recapture_schema` are unavailable in this mode. The Maxwell database is still used for positions, heartbeats, and bootstrap requests, and normal filters should still exclude gh-ost shadow tables if their row events should not be emitted.
+
+Example:
+
+```
+schema_source=binlog
+filter=exclude: *.*, include: homs.*, exclude: homs./^_.*_(gho|ghc|del)$/
+```
 
 # producer options
 option                         | argument                            | description                                         | default
@@ -324,5 +338,3 @@ A get request will return the live config state
 	"filter": "exclude: noisy_db.*"
 }
 ```
-
-

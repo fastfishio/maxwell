@@ -33,6 +33,8 @@ import java.util.regex.Pattern;
  * Configuration object for Maxwell
  */
 public class MaxwellConfig extends AbstractConfig {
+	public static final String SCHEMA_SOURCE_MYSQL = "mysql";
+	public static final String SCHEMA_SOURCE_BINLOG = "binlog";
 	static final Logger LOGGER = LoggerFactory.getLogger(MaxwellConfig.class);
 
 	/**
@@ -465,6 +467,13 @@ public class MaxwellConfig extends AbstractConfig {
 	public boolean recaptureSchema;
 
 	/**
+	 * Source used to resolve table definitions for row events.
+	 * "mysql" uses Maxwell's persisted schema history; "binlog" uses MySQL 8
+	 * FULL TABLE_MAP metadata and does not replay DDL into the schema store.
+	 */
+	public String schemaSource;
+
+	/**
 	 * float between 0 and 1, defines percentage of JVM memory to use buffering rows.
 	 * <p>
 	 *     actual formula is given as bufferMemoryUsage * Runtime.getRuntime().maxMemory().
@@ -832,6 +841,8 @@ public class MaxwellConfig extends AbstractConfig {
 
 		parser.accepts( "recapture_schema", "recapture the latest schema.  Only use if Maxwell's schema has fallen out of sync" )
 				.withOptionalArg().ofType(Boolean.class);
+		parser.accepts( "schema_source", "table schema source: mysql|binlog. binlog requires MySQL binlog_row_metadata=FULL" )
+				.withRequiredArg();
 		parser.accepts( "buffer_memory_usage", "Percentage of JVM memory available for transaction buffer.  Floating point between 0 and 1." )
 				.withRequiredArg().ofType(Float.class);
 		parser.accepts("binlog_event_queue_size", "Size of queue to buffer events parsed from binlog.")
@@ -1208,6 +1219,7 @@ public class MaxwellConfig extends AbstractConfig {
 		this.masterRecovery = fetchBooleanOption("master_recovery", options, properties, false);
 		this.ignoreProducerError = fetchBooleanOption("ignore_producer_error", options, properties, true);
 		this.recaptureSchema = fetchBooleanOption("recapture_schema", options, null, false);
+		this.schemaSource = fetchStringOption("schema_source", options, properties, SCHEMA_SOURCE_MYSQL).toLowerCase();
 		this.bufferMemoryUsage = fetchFloatOption("buffer_memory_usage", options, properties, 0.25f);
 		this.maxSchemaDeltas = fetchIntegerOption("max_schemas", options, properties, null);
 
@@ -1332,6 +1344,18 @@ public class MaxwellConfig extends AbstractConfig {
 	public void validate() {
 		validatePartitionBy();
 		validateFilter();
+
+		if (!this.schemaSource.equals(SCHEMA_SOURCE_MYSQL) && !this.schemaSource.equals(SCHEMA_SOURCE_BINLOG))
+			usageForOptions("please specify --schema_source=mysql|binlog", "--schema_source");
+
+		if (this.schemaSource.equals(SCHEMA_SOURCE_BINLOG) && this.recaptureSchema)
+			usageForOptions("--recapture_schema cannot be used with --schema_source=binlog", "--recapture_schema", "--schema_source");
+
+		if (this.schemaSource.equals(SCHEMA_SOURCE_BINLOG) && this.outputConfig.outputDDL)
+			usageForOptions("--output_ddl cannot be used with --schema_source=binlog", "--output_ddl", "--schema_source");
+
+		if (this.schemaSource.equals(SCHEMA_SOURCE_BINLOG) && this.outputConfig.includesSchemaId)
+			usageForOptions("--output_schema_id cannot be used with --schema_source=binlog", "--output_schema_id", "--schema_source");
 
 		if ( this.producerType.equals("kafka") ) {
 			if ( !this.kafkaProperties.containsKey("bootstrap.servers") ) {
