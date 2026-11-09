@@ -1,0 +1,21 @@
+substitutions:
+  _REPO: maxwell
+  _IMAGE_DESTINATION_COMMIT_SHA: europe-west1-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_REPO}:${COMMIT_SHA}
+  _IMAGE_DESTINATION_REF_NAME: europe-west1-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_REPO}:${REF_NAME}
+
+steps:
+  - name: gcr.io/kaniko-project/executor:v1.23.2
+    args:
+      - --destination=europe-west1-docker.pkg.dev/$PROJECT_ID/$_REPO/$_REPO:${COMMIT_SHA}
+      - --destination=europe-west1-docker.pkg.dev/$PROJECT_ID/$_REPO/$_REPO:${BRANCH_NAME}
+      - --destination=europe-west1-docker.pkg.dev/$PROJECT_ID/$_REPO/$_REPO:${TAG_NAME}
+      - --registry-mirror=mirror.gcr.io
+      - --cache=true
+      - --cache-ttl=6h
+  - name: gcr.io/nooncore-is/is-image-scanner:main
+    entrypoint: ''
+    env:
+      - REPO_ID=$_REPO
+      - IMAGE_REPOSITORY=europe-west1-docker.pkg.dev/$PROJECT_ID/$_REPO/$_REPO
+options:
+  logging: CLOUD_LOGGING_ONLY
