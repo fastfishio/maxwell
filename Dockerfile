@@ -16,7 +16,7 @@ RUN cd /workspace \
     && mkdir /app \
     && mv /workspace/target/maxwell-$MAXWELL_VERSION/maxwell-$MAXWELL_VERSION/* /app/ \
     && apt-get clean \
-    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* /usr/share/doc/* /workspace/ /root/.m2/ \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* /usr/share/doc/* /root/.m2/ \
     && echo "$MAXWELL_VERSION" > /REVISION
 
 # Build clean image with non-root priveledge
