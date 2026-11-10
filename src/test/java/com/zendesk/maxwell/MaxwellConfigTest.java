@@ -153,6 +153,18 @@ public class MaxwellConfigTest
 		assertEquals(config.pubsubRpcTimeoutMultiplier, 1.0f, 0.0f);
 	}
 
+	@Test
+	public void testSchemaSourceDefaultsToMysql() {
+		config = new MaxwellConfig();
+		assertEquals("mysql", config.schemaSource);
+	}
+
+	@Test
+	public void testBinlogSchemaSourceFromArgs() {
+		config = new MaxwellConfig(new String[] { "--schema_source=binlog" });
+		assertEquals("binlog", config.schemaSource);
+	}
+
 
 	private String getTestConfigDir() {
 		return System.getProperty("user.dir") + "/src/test/resources/config/";

@@ -14,6 +14,7 @@ public interface Replicator extends StoppableTask {
 	Long getLastHeartbeatRead();
 	Schema getSchema() throws SchemaStoreException;
 	Long getSchemaId() throws SchemaStoreException;
+	default boolean usesBinlogRowMetadata() { return false; }
 
 	void stopAtHeartbeat(long heartbeat);
 	void runLoop() throws Exception;

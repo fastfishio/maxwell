@@ -152,6 +152,14 @@ public class MaxwellMysqlStatus {
 	}
 
 	/**
+	 * Verify that TABLE_MAP events contain the metadata required to decode rows
+	 * without Maxwell's persisted schema history.
+	 */
+	public static void ensureFullBinlogRowMetadata(Connection c) throws SQLException, MaxwellCompatibilityError {
+		new MaxwellMysqlStatus(c).ensureVariableState("binlog_row_metadata", "FULL");
+	}
+
+	/**
 	 * Verify that the maxwell database is in the expected state
 	 * @param c a JDBC connection
 	 * @throws SQLException if we have database issues

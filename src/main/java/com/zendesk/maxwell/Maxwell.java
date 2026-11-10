@@ -99,22 +99,24 @@ public class Maxwell implements Runnable {
 			recoveredHeartbeat = masterRecovery.recover();
 
 			if (recoveredHeartbeat != null) {
-				// load up the schema from the recovery position and chain it into the
-				// new server_id
-				MysqlSchemaStore oldServerSchemaStore = new MysqlSchemaStore(
-					context.getMaxwellConnectionPool(),
-					context.getReplicationConnectionPool(),
-					context.getSchemaConnectionPool(),
-					recoveryInfo.serverID,
-					recoveryInfo.position,
-					context.getCaseSensitivity(),
-					config.filter,
-					false
-				);
+				if (!MaxwellConfig.SCHEMA_SOURCE_BINLOG.equals(config.schemaSource)) {
+					// Load up the schema from the recovery position and chain it into the
+					// new server_id. TABLE_MAP metadata mode only needs the recovered position.
+					MysqlSchemaStore oldServerSchemaStore = new MysqlSchemaStore(
+						context.getMaxwellConnectionPool(),
+						context.getReplicationConnectionPool(),
+						context.getSchemaConnectionPool(),
+						recoveryInfo.serverID,
+						recoveryInfo.position,
+						context.getCaseSensitivity(),
+						config.filter,
+						false
+					);
 
-				// Note we associate this schema to the start position of the heartbeat event, so that
-				// we pick it up when resuming at the event after the heartbeat.
-				oldServerSchemaStore.clone(context.getServerID(), recoveredHeartbeat.getPosition());
+					// Note we associate this schema to the start position of the heartbeat event, so that
+					// we pick it up when resuming at the event after the heartbeat.
+					oldServerSchemaStore.clone(context.getServerID(), recoveredHeartbeat.getPosition());
+				}
 				return recoveredHeartbeat.getNextPosition();
 			}
 		}
@@ -123,6 +125,10 @@ public class Maxwell implements Runnable {
 
 	private void logColumnCastError(ColumnDefCastException e) throws SQLException, SchemaStoreException {
 		LOGGER.error("checking for schema inconsistencies in " + e.database + "." + e.table);
+		if (this.replicator.usesBinlogRowMetadata()) {
+			LOGGER.error("row schema came from TABLE_MAP metadata; no persisted schema is available to compare");
+			return;
+		}
 		try ( Connection conn = context.getSchemaConnectionPool().getConnection();
 			  SchemaCapturer capturer = new SchemaCapturer(conn, context.getCaseSensitivity(), e.database, e.table)) {
 			Schema recaptured = capturer.capture();
@@ -242,6 +248,9 @@ public class Maxwell implements Runnable {
 		try ( Connection connection = this.context.getReplicationConnection();
 		      Connection rawConnection = this.context.getRawMaxwellConnection() ) {
 			MaxwellMysqlStatus.ensureReplicationMysqlState(connection);
+			if (MaxwellConfig.SCHEMA_SOURCE_BINLOG.equals(config.schemaSource)) {
+				MaxwellMysqlStatus.ensureFullBinlogRowMetadata(connection);
+			}
 			MaxwellMysqlStatus.ensureMaxwellMysqlState(rawConnection);
 			if (config.gtidMode) {
 				MaxwellMysqlStatus.ensureGtidMysqlState(connection);
@@ -260,16 +269,25 @@ public class Maxwell implements Runnable {
 		logBanner(producer, initPosition);
 		this.context.setPosition(initPosition);
 
-		MysqlSchemaStore mysqlSchemaStore = new MysqlSchemaStore(this.context, initPosition);
-		BootstrapController bootstrapController = this.context.getBootstrapController(mysqlSchemaStore.getSchemaID());
+		boolean useBinlogRowMetadata = MaxwellConfig.SCHEMA_SOURCE_BINLOG.equals(config.schemaSource);
+		MysqlSchemaStore mysqlSchemaStore = null;
+		Long initialSchemaID = null;
 
-		this.context.startSchemaCompactor();
+		if (useBinlogRowMetadata) {
+			LOGGER.info("Using FULL TABLE_MAP metadata for row schemas; DDL schema tracking is disabled");
+		} else {
+			mysqlSchemaStore = new MysqlSchemaStore(this.context, initPosition);
+			initialSchemaID = mysqlSchemaStore.getSchemaID();
+			this.context.startSchemaCompactor();
 
-		if (config.recaptureSchema) {
-			mysqlSchemaStore.captureAndSaveSchema();
+			if (config.recaptureSchema) {
+				mysqlSchemaStore.captureAndSaveSchema();
+			}
+
+			mysqlSchemaStore.getSchema(); // trigger schema to load / capture before we start the replicator.
 		}
 
-		mysqlSchemaStore.getSchema(); // trigger schema to load / capture before we start the replicator.
+		BootstrapController bootstrapController = this.context.getBootstrapController(initialSchemaID);
 
 		this.replicator = new BinlogConnectorReplicator(
 			mysqlSchemaStore,
@@ -289,7 +307,8 @@ public class Maxwell implements Runnable {
 			config.outputConfig,
 			config.bufferMemoryUsage,
 			config.replicationReconnectionRetries,
-			config.binlogEventQueueSize
+			config.binlogEventQueueSize,
+			useBinlogRowMetadata
 		);
 
 		context.setReplicator(replicator);
