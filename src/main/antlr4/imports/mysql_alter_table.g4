@@ -61,7 +61,7 @@ alter_partition_specification:
 ignored_alter_specifications:
     ADD index_definition
     | ALTER INDEX name (VISIBLE | INVISIBLE)
-    | ALTER COLUMN? name ((SET DEFAULT literal) | (DROP DEFAULT) | (SET (VISIBLE | INVISIBLE)))
+    | ALTER COLUMN? name ((SET DEFAULT (literal | skip_parens)) | (DROP DEFAULT) | (SET (VISIBLE | INVISIBLE)))
     | DROP INDEX if_exists? index_name
     | DISABLE KEYS
     | ENABLE KEYS
